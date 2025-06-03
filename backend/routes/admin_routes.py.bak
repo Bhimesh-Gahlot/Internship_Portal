@@ -1,0 +1,2186 @@
+from flask import Blueprint, request, jsonify
+from flask_jwt_extended import get_jwt_identity
+from models.user import User
+from models.student import Student
+from models.mentor import Mentor
+from models.mentor_assignment import MentorAssignment
+from models.internship import Internship
+from models.evaluation import Evaluation
+from extensions import db
+from functools import wraps
+from utils.access_control import admin_required, token_required
+from datetime import datetime, timedelta
+import pymysql
+import threading
+
+bp = Blueprint('admin', __name__, url_prefix='/admin')
+
+@bp.route('/users', methods=['GET'])
+@admin_required
+def get_all_users():
+    try:
+        users = User.query.all()
+        users_data = []
+        
+        conn = pymysql.connect(
+            host='localhost',
+            user='root',
+            password='yoyobheemsa',
+            database='internship_portal',
+            cursorclass=pymysql.cursors.DictCursor
+        )
+        
+        cursor = conn.cursor()
+        
+        for user in users:
+            user_data = {
+                'id': user.id,
+                'email': user.email,
+                'role': user.role
+            }
+            
+            # Add role_info for mentors
+            if user.role == 'mentor':
+                mentor = Mentor.query.filter_by(user_id=user.id).first()
+                if mentor:
+                    user_data['role_info'] = {
+                        'id': mentor.id,
+                        'name': mentor.name,
+                        'department': mentor.department,
+                        'designation': mentor.designation,
+                        'max_students': mentor.max_students
+                    }
+                    
+                    # Count assigned students using direct SQL
+                    cursor.execute("""
+                        SELECT COUNT(*) as count 
+                        FROM mentor_assignments 
+                        WHERE mentor_id = %s
+                    """, (mentor.id,))
+                    
+                    result = cursor.fetchone()
+                    assigned_students = result['count'] if result else 0
+                    user_data['role_info']['current_students'] = assigned_students
+                
+            users_data.append(user_data)
+        
+        cursor.close()
+        conn.close()
+            
+        return jsonify({
+            'users': users_data
+        })
+    except Exception as e:
+        print(f"Error fetching users: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'message': f'Failed to fetch users: {str(e)}'}), 500
+
+@bp.route('/create-user', methods=['POST', 'OPTIONS'])
+@admin_required
+def create_user():
+    # Handle preflight OPTIONS request first
+    if request.method == 'OPTIONS':
+        response = jsonify({'status': 'success'})
+        response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+        return response
+        
+    try:
+        print(f"CREATE USER ENDPOINT CALLED - Method: {request.method}, Path: {request.path}")
+        print(f"Request headers: {dict(request.headers)}")
+        
+        data = request.get_json()
+        print(f"Request data: {data}")
+        
+        # Validate required fields
+        required_fields = ['email', 'password', 'role', 'first_name', 'last_name']
+        missing_fields = [field for field in required_fields if field not in data]
+        
+        if missing_fields:
+            print(f"Missing required fields: {missing_fields}")
+            return jsonify({'error': f'Missing required fields: {", ".join(missing_fields)}'}), 400
+
+        # Check if email already exists
+        existing_user = User.query.filter_by(email=data['email']).first()
+        if existing_user:
+            print(f"Email already exists: {data['email']}")
+            return jsonify({'error': 'Email already registered'}), 400
+
+        # Create new user
+        user = User(
+            email=data['email'],
+            role=data['role'],
+            first_name=data['first_name'],
+            last_name=data['last_name']
+        )
+        user.set_password(data['password'])
+
+        # Add user to database
+        print(f"Adding new user with email: {user.email}, role: {user.role}")
+        db.session.add(user)
+        db.session.commit()
+        print(f"User created successfully with ID: {user.id}")
+
+        # Create additional role-specific profile if needed
+        if data['role'] == 'mentor':
+            mentor_data = data.get('mentor_info', {})
+            mentor = Mentor(
+                user_id=user.id,
+                name=f"{user.first_name} {user.last_name}",
+                department=mentor_data.get('department', ''),
+                designation=mentor_data.get('designation', ''),
+                max_students=mentor_data.get('max_students', 5)
+            )
+            db.session.add(mentor)
+            db.session.commit()
+            print(f"Mentor profile created with ID: {mentor.id}")
+        
+        elif data['role'] == 'student':
+            student_data = data.get('student_info', {})
+            student = Student(
+                user_id=user.id,
+                name=f"{user.first_name} {user.last_name}",  # Add the name field
+                registration_number=student_data.get('registration_number', ''),
+                batch=student_data.get('batch', '')
+            )
+            db.session.add(student)
+            db.session.commit()
+            print(f"Student profile created with ID: {student.id}")
+
+        return jsonify({
+            'message': 'User created successfully',
+            'user': user.to_dict()
+        }), 201
+
+    except Exception as e:
+        db.session.rollback()
+        import traceback
+        print(f"Error creating user: {str(e)}")
+        traceback.print_exc()
+        return jsonify({'error': f'Failed to create user: {str(e)}'}), 500
+
+def delete_user_background(user_id):
+    """Function to delete a user in the background"""
+    print(f"BACKGROUND DELETION: Starting background deletion for user {user_id}")
+    try:
+        # Connect directly to database with a short timeout
+        conn = pymysql.connect(
+            host='localhost',
+            user='root',
+            password='yoyobheemsa',
+            database='internship_portal',
+            connect_timeout=5,
+            read_timeout=30,
+            write_timeout=30
+        )
+        cursor = conn.cursor()
+
+        print(f"BACKGROUND DELETION: Connected to database, preparing to delete related records for user {user_id}")
+
+        # If user is a mentor, get the mentor_id from mentors table first
+        mentor_id = None
+        cursor.execute("SELECT role FROM users WHERE id = %s", (user_id,))
+        role_result = cursor.fetchone()
+        user_role = role_result[0] if role_result else None
+        
+        if user_role == 'mentor':
+            print(f"BACKGROUND DELETION: User is a mentor, fetching mentor_id")
+            cursor.execute("SELECT id FROM mentors WHERE user_id = %s", (user_id,))
+            mentor_result = cursor.fetchone()
+            if mentor_result:
+                mentor_id = mentor_result[0]
+                print(f"BACKGROUND DELETION: Found mentor ID {mentor_id} for user {user_id}")
+
+        # If user is a student, get the registration_number from students table first
+        registration_number = None
+        student_id = None
+        if user_role == 'student':
+            print(f"BACKGROUND DELETION: User is a student, fetching student details")
+            cursor.execute("SELECT id, registration_number FROM students WHERE user_id = %s", (user_id,))
+            student_result = cursor.fetchone()
+            if student_result:
+                student_id = student_result[0]
+                registration_number = student_result[1]
+                print(f"BACKGROUND DELETION: Found student ID {student_id} with registration number {registration_number} for user {user_id}")
+
+        # Order matters - delete in dependency order to avoid foreign key constraints
+        # 1. First delete evaluations since they depend on both students and mentors
+        if registration_number:
+            print(f"BACKGROUND DELETION: Deleting evaluations for student with registration number {registration_number}")
+            cursor.execute("DELETE FROM evaluations WHERE registration_number = %s", (registration_number,))
+            print(f"BACKGROUND DELETION: Deleted evaluations for student with registration number {registration_number}")
+        
+        if mentor_id:
+            print(f"BACKGROUND DELETION: Deleting evaluations for mentor {mentor_id}")
+            cursor.execute("DELETE FROM evaluations WHERE mentor_id = %s", (mentor_id,))
+            print(f"BACKGROUND DELETION: Deleted evaluations for mentor {mentor_id}")
+
+        # 2. Delete mentor assignments based on the specific role
+        if mentor_id:
+            print(f"BACKGROUND DELETION: Deleting mentor assignments for mentor {mentor_id}")
+            cursor.execute("DELETE FROM mentor_assignments WHERE mentor_id = %s", (mentor_id,))
+            print(f"BACKGROUND DELETION: Deleted mentor assignments for mentor {mentor_id}")
+        
+        if registration_number:
+            print(f"BACKGROUND DELETION: Deleting mentor assignments for student with registration number {registration_number}")
+            cursor.execute("DELETE FROM mentor_assignments WHERE registration_number = %s", (registration_number,))
+            print(f"BACKGROUND DELETION: Deleted mentor assignments for student with registration number {registration_number}")
+
+        # 3. Delete internships
+        if registration_number:
+            print(f"BACKGROUND DELETION: Deleting internships for student {registration_number}")
+            cursor.execute("DELETE FROM internships WHERE registration_number = %s", (registration_number,))
+            print(f"BACKGROUND DELETION: Deleted internships for student {registration_number}")
+
+        # 4. Delete role-specific records
+        if mentor_id:
+            print(f"BACKGROUND DELETION: Deleting mentor profile for mentor {mentor_id}")
+            cursor.execute("DELETE FROM mentors WHERE id = %s", (mentor_id,))
+            print(f"BACKGROUND DELETION: Deleted mentor profile for mentor {mentor_id}")
+        
+        if student_id:
+            print(f"BACKGROUND DELETION: Deleting student profile for student {student_id}")
+            cursor.execute("DELETE FROM students WHERE id = %s", (student_id,))
+            print(f"BACKGROUND DELETION: Deleted student profile for student {student_id}")
+
+        # 5. Delete password change logs
+        print(f"BACKGROUND DELETION: Deleting password change logs for user {user_id}")
+        cursor.execute("DELETE FROM password_change_logs WHERE user_id = %s OR changed_by_id = %s", (user_id, user_id))
+        print(f"BACKGROUND DELETION: Deleted password change logs for user {user_id}")
+
+        # Commit the changes
+        conn.commit()
+        print(f"BACKGROUND DELETION: Committed all direct SQL deletions")
+
+        # Finally delete the user directly with SQL too
+        print(f"BACKGROUND DELETION: Deleting user {user_id} directly from database")
+        cursor.execute("DELETE FROM users WHERE id = %s", (user_id,))
+        conn.commit()
+        print(f"BACKGROUND DELETION: User {user_id} deleted successfully via direct SQL")
+
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        print(f"BACKGROUND DELETION: Error in background deletion: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+@bp.route('/delete-user', methods=['DELETE', 'OPTIONS'])
+@admin_required
+def delete_user():
+    # Handle preflight OPTIONS request first
+    if request.method == 'OPTIONS':
+        response = jsonify({'status': 'success'})
+        response.headers.add('Access-Control-Allow-Methods', 'DELETE, OPTIONS')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+        return response
+    
+    try:
+        print(f"DELETE USER ENDPOINT CALLED - Method: {request.method}, Path: {request.path}")
+        print(f"Request headers: {dict(request.headers)}")
+        print(f"Request args: {dict(request.args)}")
+        
+        user_id = request.args.get('user_id')
+        if not user_id:
+            return jsonify({'error': 'Missing user_id parameter'}), 400
+            
+        user_id = int(user_id)  # Convert to integer
+        print(f"DELETE USER API: Attempting to delete user with ID {user_id}")
+        
+        user = User.query.get_or_404(user_id)
+        print(f"DELETE USER API: Found user {user.email} with role {user.role}")
+        
+        # Get user ID from the token data
+        current_user_id = request.token_data['user_id']
+        
+        # Don't allow deleting self
+        if user.id == current_user_id:
+            print(f"DELETE USER API: Refusing to delete self (user {user_id})")
+            return jsonify({'error': 'Cannot delete own account'}), 403
+
+        # Start a background thread to handle the actual deletion
+        # This allows us to return a response to the client quickly
+        print(f"DELETE USER API: Starting background thread for user deletion {user_id}")
+        deletion_thread = threading.Thread(target=delete_user_background, args=(user_id,))
+        deletion_thread.daemon = True
+        deletion_thread.start()
+        
+        # Return success immediately - the deletion will continue in the background
+        return jsonify({'message': f'User {user_id} deletion initiated'})
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"DELETE USER API: Error in delete_user: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@bp.route('/reset-password/<int:user_id>', methods=['POST'])
+@admin_required
+def reset_password(user_id):
+    try:
+        data = request.get_json()
+        if 'new_password' not in data:
+            return jsonify({'error': 'New password is required'}), 400
+
+        user = User.query.get_or_404(user_id)
+        user.set_password(data['new_password'])
+        db.session.commit()
+
+        return jsonify({'message': 'Password reset successful'})
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
+@bp.route('/allocate-mentor', methods=['POST'])
+@admin_required
+def allocate_mentor():
+    data = request.get_json()
+    student_id = data.get('student_id')
+    mentor_id = data.get('mentor_id')
+    
+    # Validate users and get student registration number
+    student = Student.query.get_or_404(student_id)
+    mentor = Mentor.query.get_or_404(mentor_id)
+    
+    registration_number = student.registration_number
+        
+    # Check if student already has a mentor
+    existing = MentorAssignment.query.filter_by(registration_number=registration_number).first()
+    if existing:
+        return jsonify({'error': 'Student already has a mentor assigned'}), 400
+        
+    # Create new assignment
+    assignment = MentorAssignment(
+        registration_number=registration_number,
+        mentor_id=mentor_id
+    )
+    db.session.add(assignment)
+    db.session.commit()
+    
+    return jsonify({'message': 'Mentor allocated successfully'})
+
+@bp.route('/allocate-mentor-bulk', methods=['POST'])
+@admin_required
+def allocate_mentor_bulk():
+    try:
+        data = request.get_json()
+        student_ids = data.get('student_ids', [])
+        mentor_id = data.get('mentor_id')
+        
+        # Input validation
+        if not student_ids or not mentor_id:
+            return jsonify({'error': 'Student IDs and mentor ID are required'}), 400
+            
+        if mentor_id is None:
+            return jsonify({'error': 'Mentor ID cannot be null'}), 400
+            
+        # Validate mentor
+        mentor = Mentor.query.get(mentor_id)
+        if not mentor:
+            return jsonify({'error': 'Invalid mentor ID'}), 400
+        
+        success_count = 0
+        errors = []
+        
+        # Process each student
+        for student_id in student_ids:
+            try:
+                # Validate student
+                student = Student.query.get(student_id)
+                if not student:
+                    errors.append(f'Invalid student ID: {student_id}')
+                    continue
+                
+                registration_number = student.registration_number
+                
+                # Check if student already has a mentor
+                existing = MentorAssignment.query.filter_by(registration_number=registration_number).first()
+                if existing:
+                    errors.append(f'Student {student.name} already has a mentor assigned')
+                    continue
+                
+                # Create new assignment
+                assignment = MentorAssignment(
+                    registration_number=registration_number,
+                    mentor_id=mentor_id
+                )
+                db.session.add(assignment)
+                success_count += 1
+                
+            except Exception as e:
+                errors.append(f'Error assigning student {student_id}: {str(e)}')
+                continue
+        
+        # Commit successful assignments
+        if success_count > 0:
+            try:
+                db.session.commit()
+            except Exception as e:
+                db.session.rollback()
+                return jsonify({'error': f'Database error: {str(e)}'}), 500
+        
+        return jsonify({
+            'message': f'Successfully assigned {success_count} students to mentor',
+            'errors': errors if errors else None
+        })
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': f'Unexpected error: {str(e)}'}), 500
+
+@bp.route('/reports/system', methods=['GET'])
+@admin_required
+def get_system_reports():
+    report_type = request.args.get('type', 'all')
+    
+    if report_type == 'mentor_allocation':
+        assignments = MentorAssignment.query.all()
+        return jsonify({
+            'assignments': [{
+                'mentor': assignment.mentor.email,
+                'student': assignment.student.email,
+                'mentor_id': assignment.mentor_id,
+                'student_id': assignment.student_id
+            } for assignment in assignments]
+        })
+        
+    elif report_type == 'evaluations':
+        evaluations = Evaluation.query.all()
+        return jsonify({
+            'evaluations': [{
+                'student': eval.student.email,
+                'mentor': eval.mentor.email,
+                'type': eval.evaluation_type,
+                'marks': eval.marks,
+                'submitted_at': eval.submitted_at.isoformat()
+            } for eval in evaluations]
+        })
+        
+    # Add more report types as needed
+    
+    return jsonify({'error': 'Invalid report type'}), 400
+
+@bp.route('/students', methods=['GET'])
+@admin_required
+def get_all_students():
+    try:
+        print("Admin is fetching all students")
+        # Connect directly to database
+        conn = pymysql.connect(
+            host='localhost',
+            user='root',
+            password='yoyobheemsa',
+            database='internship_portal',
+            cursorclass=pymysql.cursors.DictCursor
+        )
+        cursor = conn.cursor()
+        
+        # Get all students with their user, mentor, and internship information using JOINs
+        query = """
+        SELECT 
+            s.id, 
+            s.user_id, 
+            s.name, 
+            s.registration_number, 
+            s.batch, 
+            u.email,
+            m.id as mentor_id,
+            m.name as mentor_name,
+            m.department as mentor_department,
+            i.company_name,
+            i.internship_type,
+            i.stipend,
+            i.location
+        FROM 
+            students s
+        LEFT JOIN 
+            users u ON s.user_id = u.id
+        LEFT JOIN 
+            mentor_assignments ma ON s.registration_number = ma.registration_number
+        LEFT JOIN 
+            mentors m ON ma.mentor_id = m.id
+        LEFT JOIN 
+            internships i ON s.registration_number = i.registration_number
+        ORDER BY 
+            s.name
+        """
+        cursor.execute(query)
+        students = cursor.fetchall()
+        print(f"Found {len(students)} students in database")
+        print(f"Raw student data: {students[:2]}")  # Print first 2 students for debugging
+        
+        # Format data
+        student_list = []
+        for student in students:
+            print(f"Processing student: {student['name']} (ID: {student['id']})")
+            student_data = {
+                'id': student['id'],
+                'user_id': student['user_id'],
+                'name': student['name'],
+                'email': student['email'],
+                'registration_number': student['registration_number'],
+                'batch': student['batch']
+            }
+            
+            # Add mentor information if available
+            if student.get('mentor_id'):
+                student_data['mentor'] = {
+                    'id': student['mentor_id'],
+                    'name': student['mentor_name'],
+                    'department': student['mentor_department']
+                }
+                print(f"  - Student has mentor: {student['mentor_name']}")
+            else:
+                print(f"  - Student has no mentor assigned")
+            
+            # Add internship information if available
+            if student.get('company_name'):
+                student_data['internship'] = {
+                    'company_name': student['company_name'],
+                    'internship_type': student['internship_type'],
+                    'stipend': student['stipend'],
+                    'location': student['location']
+                }
+                print(f"  - Student has internship at: {student['company_name']}")
+            else:
+                print(f"  - Student has no internship data")
+            
+            # Add student to list
+            student_list.append(student_data)
+            print(f"Added student {student['name']} to list, current count: {len(student_list)}")
+                
+        cursor.close()
+        conn.close()
+        
+        print(f"Returning {len(student_list)} students to client")
+        return jsonify({'students': student_list})
+    
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+@bp.route('/students/<int:student_id>', methods=['GET'])
+@admin_required
+def get_student_detail(student_id):
+    try:
+        student = Student.query.get_or_404(student_id)
+        user = User.query.get(student.user_id)
+        
+        # Get internship using registration_number
+        internship = Internship.query.filter_by(registration_number=student.registration_number).first()
+        
+        mentor = None
+        if student.mentor_id:
+            mentor = Mentor.query.get(student.mentor_id)
+        
+        student_data = {
+            'id': student.id,
+            'user_id': student.user_id,
+            'name': student.name,
+            'email': user.email,
+            'registration_number': student.registration_number,
+            'batch': student.batch,
+            'mentor': {
+                'name': mentor.name if mentor else None,
+                'department': mentor.department if mentor else None
+            } if mentor else None,
+            'internship': internship.to_dict() if internship else None
+        }
+        
+        return jsonify(student_data)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@bp.route('/students/<int:student_id>', methods=['PUT'])
+@admin_required
+def update_student(student_id):
+    try:
+        student = Student.query.get_or_404(student_id)
+        data = request.get_json()
+        
+        # Update student details
+        if 'name' in data:
+            student.name = data['name']
+        if 'registration_number' in data:
+            # Check if registration number is already in use by another student
+            existing = Student.query.filter(
+                Student.registration_number == data['registration_number'],
+                Student.id != student_id
+            ).first()
+            if existing:
+                return jsonify({'error': 'Registration number already in use'}), 400
+            
+            old_reg_number = student.registration_number
+            student.registration_number = data['registration_number']
+            
+            # Also update all references in other tables
+            for model in [Internship, Evaluation, WeeklyReport, MentorFeedback, Progress, WeeklyFeedback]:
+                items = model.query.filter_by(registration_number=old_reg_number).all()
+                for item in items:
+                    item.registration_number = data['registration_number']
+            
+        if 'batch' in data:
+            student.batch = data['batch']
+        if 'mentor_id' in data:
+            student.mentor_id = data['mentor_id']
+            
+        # Update internship details if provided
+        if 'internship' in data:
+            # Find internship by registration_number
+            internship = Internship.query.filter_by(registration_number=student.registration_number).first()
+            if not internship:
+                # Create new internship with student details
+                internship = Internship(
+                    name=student.name,
+                    registration_number=student.registration_number,
+                    company_name='',
+                    internship_type='',
+                    start_date=datetime.now().date(),
+                    end_date=(datetime.now() + timedelta(days=90)).date()
+                )
+                db.session.add(internship)
+                
+            internship_data = data['internship']
+            if 'company_name' in internship_data:
+                internship.company_name = internship_data['company_name']
+            if 'internship_type' in internship_data:
+                internship.internship_type = internship_data['internship_type']
+            if 'start_date' in internship_data:
+                internship.start_date = datetime.strptime(internship_data['start_date'], '%Y-%m-%d').date()
+            if 'end_date' in internship_data:
+                internship.end_date = datetime.strptime(internship_data['end_date'], '%Y-%m-%d').date()
+            if 'stipend' in internship_data:
+                internship.stipend = float(internship_data['stipend'])
+            if 'location' in internship_data:
+                internship.location = internship_data['location']
+            if 'hr_contact' in internship_data:
+                internship.hr_contact = internship_data['hr_contact']
+            if 'hr_email' in internship_data:
+                internship.hr_email = internship_data['hr_email']
+        
+        db.session.commit()
+        return jsonify({'message': 'Student updated successfully'})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
+@bp.route('/students/<int:student_id>', methods=['DELETE'])
+@admin_required
+def delete_student(student_id):
+    try:
+        student = Student.query.get_or_404(student_id)
+        user_id = student.user_id
+        registration_number = student.registration_number
+        
+        # Delete related records using registration_number
+        Internship.query.filter_by(registration_number=registration_number).delete()
+        Evaluation.query.filter_by(registration_number=registration_number).delete()
+        WeeklyReport.query.filter_by(registration_number=registration_number).delete()
+        MentorFeedback.query.filter_by(registration_number=registration_number).delete()
+        Progress.query.filter_by(registration_number=registration_number).delete()
+        WeeklyFeedback.query.filter_by(registration_number=registration_number).delete()
+        
+        # Delete student and user
+        db.session.delete(student)
+        user = User.query.get(user_id)
+        if user:
+            db.session.delete(user)
+            
+        db.session.commit()
+        return jsonify({'message': 'Student deleted successfully'})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
+@bp.route('/users/<int:user_id>/password', methods=['GET'])
+@admin_required
+def get_user_password(user_id):
+    try:
+        user = User.query.get_or_404(user_id)
+        
+        # Since passwords are stored in plaintext in this application,
+        # we can directly access the password field
+        
+        return jsonify({
+            'user_id': user.id,
+            'email': user.email,
+            'password': user.password
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@bp.route('/create-test-data', methods=['POST'])
+@admin_required
+def create_test_data():
+    try:
+        # Check if admin users exist
+        admin_count = User.query.filter_by(role='admin').count()
+        
+        # Check if mentor users exist
+        mentor_count = User.query.filter_by(role='mentor').count()
+        
+        # Check if student users exist
+        student_count = User.query.filter_by(role='student').count()
+        
+        # Create admin if none exists
+        if admin_count == 0:
+            admin = User(email='admin@example.com', role='admin')
+            admin.set_password('admin123')
+            db.session.add(admin)
+            db.session.commit()  # Commit to get the admin ID
+        
+        created = {
+            'admins': 0,
+            'mentors': 0,
+            'students': 0
+        }
+        
+        # Create test mentors if needed
+        if mentor_count == 0 or request.json.get('force', False):
+            # Department options
+            departments = ['Computer Science', 'Electrical Engineering', 'Mechanical Engineering', 
+                          'Civil Engineering', 'Chemical Engineering']
+            
+            # Add 5 test mentors
+            for i in range(1, 6):
+                email = f'mentor{i}@example.com'
+                # Check if mentor already exists
+                existing = User.query.filter_by(email=email).first()
+                if not existing:
+                    mentor_user = User(email=email, role='mentor')
+                    mentor_user.set_password('mentor123')
+                    db.session.add(mentor_user)
+                    db.session.flush()  # Get the ID without committing
+                    
+                    # Create mentor profile
+                    mentor = Mentor(
+                        user_id=mentor_user.id,
+                        name=f'Mentor {i}',
+                        department=departments[i % len(departments)],
+                        designation='Professor',
+                        max_students=5
+                    )
+                    db.session.add(mentor)
+                    created['mentors'] += 1
+            
+            db.session.commit()
+        
+        # Create test students if needed
+        if student_count == 0 or request.json.get('force', False):
+            # Get all mentor IDs
+            mentor_records = Mentor.query.all()
+            mentor_ids = [m.id for m in mentor_records]
+            
+            # Add 10 test students
+            for i in range(1, 11):
+                email = f'student{i}@example.com'
+                # Check if student already exists
+                existing = User.query.filter_by(email=email).first()
+                if not existing:
+                    # Create student user
+                    student_user = User(email=email, role='student')
+                    student_user.set_password('student123')
+                    db.session.add(student_user)
+                    db.session.flush()  # Get the ID without committing
+                    
+                    # Create student profile with registration number and batch
+                    reg_number = f'2023CS{i:03d}'
+                    batch = f'Batch 202{i % 3 + 1}'
+                    
+                    # Add student record
+                    student = Student(
+                        user_id=student_user.id,
+                        name=f'Student {i}',
+                        registration_number=reg_number,
+                        batch=batch
+                    )
+                    db.session.add(student)
+                    db.session.flush()
+                    
+                    # Assign a mentor if mentors exist
+                    if mentor_ids:
+                        mentor_id = mentor_ids[i % len(mentor_ids)]
+                        mentor_assignment = MentorAssignment(
+                            student_id=student.id,
+                            mentor_id=mentor_id
+                        )
+                        db.session.add(mentor_assignment)
+                    
+                    created['students'] += 1
+            
+            db.session.commit()
+            
+            # Add test internship data for a few students
+            students = Student.query.limit(5).all()
+            for i, student in enumerate(students):
+                # Check if internship already exists
+                existing = Internship.query.filter_by(registration_number=student.registration_number).first()
+                if not existing:
+                    # Create test internship
+                    company_names = ['Google', 'Microsoft', 'Amazon', 'Facebook', 'Apple']
+                    internship_types = ['Remote', 'In-Office', 'Hybrid']
+                    locations = ['Bangalore', 'Mumbai', 'Delhi', 'Hyderabad', 'Pune']
+                    
+                    start_date = datetime.now() + timedelta(days=30*i)
+                    end_date = start_date + timedelta(days=90)
+                    
+                    internship = Internship(
+                        name=student.name,
+                        registration_number=student.registration_number,
+                        company_name=company_names[i],
+                        internship_type=internship_types[i % len(internship_types)],
+                        start_date=start_date,
+                        end_date=end_date,
+                        stipend=10000 + (i * 1000),
+                        location=locations[i % len(locations)],
+                        hr_contact=f'123456789{i}',
+                        hr_email=f'hr{i}@{company_names[i].lower()}.com'
+                    )
+                    db.session.add(internship)
+            
+            db.session.commit()
+        
+        return jsonify({
+            'message': f"Created test data: {created['admins']} admins, {created['mentors']} mentors, {created['students']} students",
+            'created': created
+        })
+        
+    except Exception as e:
+        db.session.rollback()
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+@bp.route('/mentors', methods=['GET'])
+@admin_required
+def get_mentors():
+    try:
+        # Get current user from token data
+        admin_id = request.token_data['user_id']
+        print(f"Admin {admin_id} is fetching all mentors")
+        
+        # Connect directly to database for reliable data fetching
+        conn = pymysql.connect(
+            host='localhost',
+            user='root',
+            password='yoyobheemsa',
+            database='internship_portal'
+        )
+        
+        cursor = conn.cursor(pymysql.cursors.DictCursor)
+        
+        # Fetch all mentors with user information
+        query = """
+        SELECT m.*, u.email, u.role
+        FROM mentors m
+        JOIN users u ON m.user_id = u.id
+        """
+        cursor.execute(query)
+        mentors = cursor.fetchall()
+        
+        # Format data
+        mentor_list = []
+        for mentor in mentors:
+            # Count assigned students
+            cursor.execute("""
+                SELECT COUNT(*) as student_count
+                FROM mentor_assignments
+                WHERE mentor_id = %s
+            """, (mentor['id'],))
+            count_result = cursor.fetchone()
+            student_count = count_result['student_count'] if count_result else 0
+            
+            mentor_data = {
+                'id': mentor['id'],
+                'user_id': mentor['user_id'],
+                'name': mentor['name'],
+                'email': mentor['email'],
+                'department': mentor['department'],
+                'designation': mentor['designation'],
+                'max_students': mentor['max_students'],
+                'current_students': student_count
+            }
+            
+            mentor_list.append(mentor_data)
+        
+        cursor.close()
+        conn.close()
+        
+        return jsonify({'mentors': mentor_list})
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+@bp.route('/assign-mentor', methods=['POST'])
+@admin_required
+def assign_mentor():
+    try:
+        data = request.get_json()
+        
+        # Validate input data
+        if not data or 'student_id' not in data or 'mentor_id' not in data:
+            return jsonify({'error': 'Missing required fields: student_id and mentor_id'}), 400
+        
+        student_id = data['student_id']
+        mentor_id = data['mentor_id']
+        
+        print(f"Admin is assigning mentor {mentor_id} to student {student_id}")
+        
+        # Connect directly to database for safer operations
+        conn = pymysql.connect(
+            host='localhost',
+            user='root',
+            password='yoyobheemsa',
+            database='internship_portal',
+            cursorclass=pymysql.cursors.DictCursor
+        )
+        cursor = conn.cursor()
+        
+        # Check if student exists
+        cursor.execute("SELECT id, registration_number, name FROM students WHERE id = %s", (student_id,))
+        student = cursor.fetchone()
+        if not student:
+            conn.close()
+            return jsonify({'error': 'Student not found'}), 404
+            
+        # Check if mentor exists
+        cursor.execute("SELECT id, name, max_students FROM mentors WHERE id = %s", (mentor_id,))
+        mentor = cursor.fetchone()
+        if not mentor:
+            conn.close()
+            return jsonify({'error': 'Mentor not found'}), 404
+        
+        # Check if mentor has reached their maximum number of students
+        max_students = mentor['max_students'] if mentor['max_students'] else 5  # Default to 5 if not set
+        
+        cursor.execute("SELECT COUNT(*) as count FROM mentor_assignments WHERE mentor_id = %s", (mentor_id,))
+        current_students = cursor.fetchone()['count']
+        
+        if current_students >= max_students:
+            conn.close()
+            return jsonify({'error': f'Mentor has reached maximum number of students ({max_students})'}), 400
+        
+        # Get student registration number
+        registration_number = student['registration_number']
+        
+        # Check if student already has a mentor
+        cursor.execute("SELECT mentor_id FROM mentor_assignments WHERE registration_number = %s", (registration_number,))
+        existing_assignment = cursor.fetchone()
+        
+        if existing_assignment:
+            if existing_assignment['mentor_id'] == mentor_id:
+                conn.close()
+                return jsonify({'message': 'Student is already assigned to this mentor'}), 200
+                
+            # Get old mentor name for logging
+            cursor.execute("SELECT name FROM mentors WHERE id = %s", (existing_assignment['mentor_id'],))
+            old_mentor = cursor.fetchone()
+            old_mentor_name = old_mentor['name'] if old_mentor else "Unknown"
+            
+            print(f"Updating student {student['name']}'s mentor from {old_mentor_name} to {mentor['name']}")
+            
+            # Update existing assignment
+            cursor.execute("""
+                UPDATE mentor_assignments 
+                SET mentor_id = %s 
+                WHERE registration_number = %s
+            """, (mentor_id, registration_number))
+            
+            message = f"Student reassigned from {old_mentor_name} to {mentor['name']}"
+        else:
+            # Create new assignment
+            cursor.execute("""
+                INSERT INTO mentor_assignments (registration_number, mentor_id)
+                VALUES (%s, %s)
+            """, (registration_number, mentor_id))
+            
+            print(f"Assigning student {student['name']} to mentor {mentor['name']}")
+            message = f"Student {student['name']} assigned to mentor {mentor['name']}"
+        
+        # Update any internships for this student to reference the mentor
+        cursor.execute("""
+            UPDATE internships 
+            SET mentor_id = %s 
+            WHERE registration_number = %s AND (mentor_id IS NULL OR mentor_id != %s)
+        """, (mentor_id, registration_number, mentor_id))
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        return jsonify({'message': message, 'success': True})
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e), 'success': False}), 500
+
+@bp.route('/unassign-mentor/<int:student_id>', methods=['DELETE'])
+@admin_required
+def unassign_mentor(student_id):
+    """Remove mentor assignment from a student"""
+    try:
+        # Check if student exists
+        student = Student.query.get(student_id)
+        if not student:
+            return jsonify({'message': 'Student not found'}), 404
+            
+        # Check if student has a mentor
+        assignment = MentorAssignment.query.filter_by(registration_number=student.registration_number).first()
+        if not assignment:
+            return jsonify({'message': 'Student does not have an assigned mentor'}), 400
+            
+        # Delete the assignment
+        db.session.delete(assignment)
+        db.session.commit()
+        
+        return jsonify({'message': 'Mentor unassigned successfully'}), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        print(f"Error unassigning mentor: {str(e)}")
+        return jsonify({'message': f'Failed to unassign mentor: {str(e)}'}), 500
+
+@bp.route('/create-test-mentors', methods=['POST'])
+@admin_required
+def create_test_mentors():
+    try:
+        # Check if we already have mentors
+        existing_mentors = Mentor.query.count()
+        if existing_mentors > 0:
+            return jsonify({
+                'message': f'Database already contains {existing_mentors} mentors. No test data created.'
+            })
+            
+        # Create test users and mentors
+        test_mentors = [
+            {
+                'email': 'dr.sharma@example.com',
+                'password': 'password123',
+                'name': 'Dr. Rajesh Sharma',
+                'department': 'Computer Science',
+                'designation': 'Associate Professor',
+                'max_students': 5
+            },
+            {
+                'email': 'prof.patel@example.com',
+                'password': 'password123',
+                'name': 'Prof. Anita Patel',
+                'department': 'Information Technology',
+                'designation': 'Assistant Professor',
+                'max_students': 3
+            },
+            {
+                'email': 'dr.mehta@example.com',
+                'password': 'password123',
+                'name': 'Dr. Vikram Mehta',
+                'department': 'Computer Engineering',
+                'designation': 'Professor',
+                'max_students': 4
+            }
+        ]
+        
+        created_mentors = []
+        for mentor_data in test_mentors:
+            try:
+                # Check if email exists
+                existing_user = User.query.filter_by(email=mentor_data['email']).first()
+                if existing_user:
+                    continue
+                    
+                # Create user
+                user = User(
+                    email=mentor_data['email'],
+                    role='mentor'
+                )
+                user.set_password(mentor_data['password'])
+                db.session.add(user)
+                db.session.flush()  # Get user ID
+                
+                print(f"Creating mentor with data: {mentor_data}")
+                
+                # Create mentor
+                mentor = Mentor(
+                    user_id=user.id,
+                    name=mentor_data['name'],
+                    department=mentor_data['department'],
+                    designation=mentor_data['designation'],
+                    max_students=mentor_data['max_students']
+                )
+                db.session.add(mentor)
+                
+                created_mentors.append(mentor_data['name'])
+            except Exception as inner_e:
+                print(f"Error creating mentor {mentor_data['name']}: {str(inner_e)}")
+                # Continue with next mentor instead of failing entire batch
+                continue
+                
+        if created_mentors:
+            db.session.commit()
+            return jsonify({
+                'message': f'Successfully created {len(created_mentors)} test mentors: {", ".join(created_mentors)}'
+            })
+        else:
+            return jsonify({
+                'message': 'No test mentors were created. Check server logs for details.'
+            })
+    except Exception as e:
+        db.session.rollback()
+        print(f"Error creating test mentor data: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@bp.route('/mentors/<int:mentor_id>', methods=['PUT'])
+@admin_required
+def update_mentor(mentor_id):
+    """Update mentor information"""
+    try:
+        print(f"Updating mentor with ID: {mentor_id}")
+        data = request.get_json()
+        print(f"Received data: {data}")
+        
+        if not data:
+            return jsonify({'message': 'No data provided'}), 400
+            
+        # Get the mentor
+        mentor = Mentor.query.get(mentor_id)
+        if not mentor:
+            return jsonify({'message': 'Mentor not found'}), 404
+            
+        print(f"Found mentor: {mentor.name} (ID: {mentor.id})")
+        
+        # Update mentor fields
+        if 'name' in data:
+            mentor.name = data['name']
+        if 'department' in data:
+            mentor.department = data['department']
+        if 'designation' in data:
+            mentor.designation = data['designation']
+        if 'max_students' in data:
+            mentor.max_students = data['max_students']
+            
+        db.session.commit()
+        print(f"Mentor updated successfully: {mentor.name}")
+        
+        return jsonify({
+            'message': 'Mentor updated successfully',
+            'mentor': {
+                'id': mentor.id,
+                'name': mentor.name,
+                'department': mentor.department,
+                'designation': mentor.designation,
+                'max_students': mentor.max_students
+            }
+        }), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        print(f"Error updating mentor: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'message': f'Failed to update mentor: {str(e)}'}), 500
+
+@bp.route('/users/<int:user_id>', methods=['PUT'])
+@admin_required
+def update_user(user_id):
+    """Update user information including role_info for mentors"""
+    try:
+        print(f"Updating user with ID: {user_id}")
+        data = request.get_json()
+        print(f"Received data: {data}")
+        
+        if not data:
+            return jsonify({'message': 'No data provided'}), 400
+            
+        # Get the user
+        user = User.query.get(user_id)
+        if not user:
+            return jsonify({'message': 'User not found'}), 404
+            
+        print(f"Found user: {user.email} (ID: {user.id}, Role: {user.role})")
+        
+        # Update user fields
+        if 'email' in data:
+            user.email = data['email']
+        if 'password' in data and data['password']:
+            user.set_password(data['password'])
+            
+        # Update mentor role_info if user is a mentor
+        if user.role == 'mentor' and 'role_info' in data:
+            mentor = Mentor.query.filter_by(user_id=user.id).first()
+            
+            if not mentor:
+                # Create mentor profile if it doesn't exist
+                mentor = Mentor(
+                    user_id=user.id,
+                    name=data['role_info'].get('name', 'Unnamed Mentor'),
+                    department=data['role_info'].get('department', ''),
+                    designation=data['role_info'].get('designation', ''),
+                    max_students=data['role_info'].get('max_students', 5)
+                )
+                db.session.add(mentor)
+            else:
+                # Update existing mentor profile
+                if 'name' in data['role_info']:
+                    mentor.name = data['role_info']['name']
+                if 'department' in data['role_info']:
+                    mentor.department = data['role_info']['department']
+                if 'designation' in data['role_info']:
+                    mentor.designation = data['role_info']['designation']
+                if 'max_students' in data['role_info']:
+                    mentor.max_students = data['role_info']['max_students']
+            
+        db.session.commit()
+        print(f"User updated successfully: {user.email}")
+        
+        # Prepare response with role_info if applicable
+        response_data = {
+            'message': 'User updated successfully',
+            'user': {
+                'id': user.id,
+                'email': user.email,
+                'role': user.role
+            }
+        }
+        
+        # Include role_info for mentors
+        if user.role == 'mentor':
+            mentor = Mentor.query.filter_by(user_id=user.id).first()
+            if mentor:
+                response_data['user']['role_info'] = {
+                    'id': mentor.id,
+                    'name': mentor.name,
+                    'department': mentor.department,
+                    'designation': mentor.designation,
+                    'max_students': mentor.max_students
+                }
+        
+        return jsonify(response_data), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        print(f"Error updating user: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'message': f'Failed to update user: {str(e)}'}), 500
+
+@bp.route('/test-delete', methods=['DELETE', 'GET', 'OPTIONS'])
+@token_required
+def test_delete():
+    """Test endpoint for DELETE requests"""
+    print(f"Test delete endpoint called with method: {request.method}")
+    # Handle preflight OPTIONS request
+    if request.method == 'OPTIONS':
+        response = jsonify({'status': 'success'})
+        response.headers.add('Access-Control-Allow-Methods', 'DELETE, GET, OPTIONS')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+        return response
+        
+    # For any actual request
+    return jsonify({
+        'message': 'Delete test successful',
+        'method': request.method,
+        'path': request.path,
+        'query_string': request.query_string.decode('utf-8'),
+        'headers': dict(request.headers),
+        'args': dict(request.args)
+    })
+
+@bp.route('/users/<int:user_id>', methods=['DELETE', 'OPTIONS'])
+@admin_required
+def delete_user_by_id(user_id):
+    """Handle DELETE requests to /admin/users/{user_id}"""
+    print(f"DELETE USER BY ID ENDPOINT CALLED - Method: {request.method}, Path: {request.path}")
+    
+    # Handle preflight OPTIONS request first
+    if request.method == 'OPTIONS':
+        response = jsonify({'status': 'success'})
+        response.headers.add('Access-Control-Allow-Methods', 'DELETE, OPTIONS')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+        return response
+        
+    # Set user_id in request.args to reuse the existing delete_user function
+    request.args = {'user_id': str(user_id)}
+    return delete_user()
+
+@bp.route('/diagnostics/students', methods=['GET'])
+@admin_required
+def diagnose_students():
+    """Diagnostic endpoint to check students table and data structure"""
+    try:
+        connection_info = {}
+        # Connect directly to database
+        conn = pymysql.connect(
+            host='localhost',
+            user='root',
+            password='yoyobheemsa',
+            database='internship_portal',
+            cursorclass=pymysql.cursors.DictCursor
+        )
+        cursor = conn.cursor()
+        
+        # Check if students table exists
+        cursor.execute("SHOW TABLES LIKE 'students'")
+        table_exists = cursor.fetchone() is not None
+        connection_info['students_table_exists'] = table_exists
+        
+        # Get table structure
+        table_structure = None
+        if table_exists:
+            cursor.execute("DESCRIBE students")
+            table_structure = cursor.fetchall()
+        connection_info['students_table_structure'] = table_structure
+            
+        # Count students
+        student_count = 0
+        if table_exists:
+            cursor.execute("SELECT COUNT(*) as count FROM students")
+            result = cursor.fetchone()
+            student_count = result['count'] if result else 0
+        connection_info['student_count'] = student_count
+        
+        # Get a sample of students if any exist
+        sample_students = []
+        if student_count > 0:
+            cursor.execute("SELECT * FROM students LIMIT 5")
+            sample_students = cursor.fetchall()
+        connection_info['sample_students'] = sample_students
+        
+        # Check users table for student role users
+        cursor.execute("SELECT COUNT(*) as count FROM users WHERE role = 'student'")
+        student_users_count = cursor.fetchone()['count']
+        connection_info['student_users_count'] = student_users_count
+        
+        # Check for orphaned records - students without users
+        cursor.execute("""
+            SELECT s.id, s.user_id, s.name FROM students s 
+            LEFT JOIN users u ON s.user_id = u.id 
+            WHERE u.id IS NULL
+        """)
+        orphaned_students = cursor.fetchall()
+        connection_info['orphaned_students'] = orphaned_students
+        
+        # Check for missing student records - users with student role but no student record
+        cursor.execute("""
+            SELECT u.id, u.email FROM users u 
+            LEFT JOIN students s ON u.id = s.user_id 
+            WHERE u.role = 'student' AND s.id IS NULL
+        """)
+        missing_student_records = cursor.fetchall()
+        connection_info['missing_student_records'] = missing_student_records
+        
+        cursor.close()
+        conn.close()
+        
+        return jsonify({
+            'message': 'Diagnostic information for students table',
+            'connection_info': connection_info
+        })
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+@bp.route('/debug-data', methods=['GET'])
+@admin_required
+def debug_database():
+    """Endpoint to debug database tables and relationships"""
+    try:
+        result = {
+            'tables': {},
+            'relationships': {}
+        }
+        
+        # Connect to the database
+        conn = pymysql.connect(
+            host='localhost',
+            user='root',
+            password='yoyobheemsa',
+            database='internship_portal',
+            cursorclass=pymysql.cursors.DictCursor
+        )
+        cursor = conn.cursor()
+        
+        # Get list of tables
+        cursor.execute("SHOW TABLES")
+        tables = [t[f'Tables_in_{conn.db.decode()}'] for t in cursor.fetchall()]
+        result['tables']['list'] = tables
+        
+        # For each table, get row count
+        for table in tables:
+            cursor.execute(f"SELECT COUNT(*) as count FROM {table}")
+            count = cursor.fetchone()['count']
+            result['tables'][table] = {'count': count}
+            
+            # Get sample of data
+            if count > 0:
+                cursor.execute(f"SELECT * FROM {table} LIMIT 3")
+                result['tables'][table]['sample'] = cursor.fetchall()
+        
+        # Check student-mentor relationships
+        cursor.execute("""
+            SELECT 
+                s.id as student_id, s.name as student_name, s.user_id as student_user_id, s.registration_number,
+                ma.id as assignment_id, ma.mentor_id, ma.registration_number as assigned_registration_number,
+                m.id as mentor_table_id, m.name as mentor_name, m.user_id as mentor_user_id
+            FROM 
+                students s
+            LEFT JOIN 
+                mentor_assignments ma ON s.registration_number = ma.registration_number
+            LEFT JOIN 
+                mentors m ON ma.mentor_id = m.id
+            LIMIT 10
+        """)
+        result['relationships']['student_mentor'] = cursor.fetchall()
+        
+        cursor.close()
+        conn.close()
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+@bp.route('/fix-student-records', methods=['POST'])
+@admin_required
+def fix_student_records():
+    """Create missing student records for users with student role"""
+    try:
+        # Connect to database
+        conn = pymysql.connect(
+            host='localhost',
+            user='root',
+            password='yoyobheemsa',
+            database='internship_portal',
+            cursorclass=pymysql.cursors.DictCursor
+        )
+        cursor = conn.cursor()
+        
+        # Find users with student role who don't have student records
+        cursor.execute("""
+            SELECT u.id, u.email FROM users u
+            LEFT JOIN students s ON u.id = s.user_id
+            WHERE u.role = 'student' AND s.id IS NULL
+        """)
+        users_without_records = cursor.fetchall()
+        
+        if not users_without_records:
+            return jsonify({
+                'message': 'No missing student records found.',
+                'fixed_count': 0
+            })
+        
+        print(f"Found {len(users_without_records)} users with student role but no student record")
+        
+        # Create student records for these users
+        created_count = 0
+        for user in users_without_records:
+            user_id = user['id']
+            email = user['email']
+            name = email.split('@')[0].replace('.', ' ').title()  # Generate name from email
+            reg_number = f"REG{user_id:04d}"
+            batch = "2023"
+            
+            # Insert student record
+            cursor.execute("""
+                INSERT INTO students (user_id, name, registration_number, batch)
+                VALUES (%s, %s, %s, %s)
+            """, (user_id, name, reg_number, batch))
+            
+            created_count += 1
+            print(f"Created student record for user {user_id} ({email})")
+        
+        # Create mentor assignments (assign each student to a mentor if mentors exist)
+        # First check if there are mentors
+        cursor.execute("SELECT COUNT(*) as count FROM mentors")
+        mentor_count = cursor.fetchone()['count']
+        
+        if mentor_count > 0:
+            # Get all mentors
+            cursor.execute("SELECT id FROM mentors")
+            mentors = cursor.fetchall()
+            mentor_ids = [m['id'] for m in mentors]
+            
+            # Get students we just created
+            cursor.execute("""
+                SELECT s.id, s.user_id, s.registration_number FROM students s
+                JOIN users u ON s.user_id = u.id
+                WHERE u.role = 'student' AND NOT EXISTS (
+                    SELECT 1 FROM mentor_assignments ma WHERE ma.registration_number = s.registration_number
+                )
+            """)
+            students = cursor.fetchall()
+            
+            # Assign each student to a mentor
+            for i, student in enumerate(students):
+                mentor_id = mentor_ids[i % len(mentor_ids)]
+                try:
+                    cursor.execute("""
+                        INSERT INTO mentor_assignments (registration_number, mentor_id)
+                        VALUES (%s, %s)
+                    """, (student['registration_number'], mentor_id))
+                    print(f"Assigned student {student['id']} to mentor {mentor_id}")
+                except Exception as e:
+                    print(f"Failed to assign student {student['id']} to mentor {mentor_id}: {str(e)}")
+        
+        # Commit changes
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        return jsonify({
+            'message': f'Created {created_count} student records for existing users.',
+            'fixed_count': created_count
+        })
+        
+    except Exception as e:
+        if 'conn' in locals() and conn:
+            conn.rollback()
+            conn.close()
+        
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+@bp.route('/fix-mentor-records', methods=['POST'])
+@admin_required
+def fix_mentor_records():
+    """Create missing mentor records for users with mentor role"""
+    try:
+        # Connect to database
+        conn = pymysql.connect(
+            host='localhost',
+            user='root',
+            password='yoyobheemsa',
+            database='internship_portal',
+            cursorclass=pymysql.cursors.DictCursor
+        )
+        cursor = conn.cursor()
+        
+        # Find users with mentor role who don't have mentor records
+        cursor.execute("""
+            SELECT u.id, u.email FROM users u
+            LEFT JOIN mentors m ON u.id = m.user_id
+            WHERE u.role = 'mentor' AND m.id IS NULL
+        """)
+        users_without_records = cursor.fetchall()
+        
+        if not users_without_records:
+            return jsonify({
+                'message': 'No missing mentor records found.',
+                'fixed_count': 0
+            })
+        
+        print(f"Found {len(users_without_records)} users with mentor role but no mentor record")
+        
+        # Prepare departments for random assignment
+        departments = ['Computer Science', 'Electrical Engineering', 'Mechanical Engineering', 
+                      'Civil Engineering', 'Chemical Engineering']
+        
+        # Create mentor records for these users
+        created_count = 0
+        for user in users_without_records:
+            user_id = user['id']
+            email = user['email']
+            name = email.split('@')[0].replace('.', ' ').title()  # Generate name from email
+            department = departments[user_id % len(departments)]
+            designation = "Assistant Professor"
+            max_students = 5
+            
+            # Insert mentor record
+            cursor.execute("""
+                INSERT INTO mentors (user_id, name, department, designation, max_students)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (user_id, name, department, designation, max_students))
+            
+            created_count += 1
+            print(f"Created mentor record for user {user_id} ({email})")
+        
+        # Commit changes
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        return jsonify({
+            'message': f'Created {created_count} mentor records for existing users.',
+            'fixed_count': created_count
+        })
+        
+    except Exception as e:
+        if 'conn' in locals() and conn:
+            conn.rollback()
+            conn.close()
+        
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+@bp.route('/recover-data', methods=['POST'])
+@admin_required
+def recover_data():
+    """Recover and fix database data while preserving existing information"""
+    try:
+        # Connect to database
+        conn = pymysql.connect(
+            host='localhost',
+            user='root',
+            password='yoyobheemsa',
+            database='internship_portal',
+            cursorclass=pymysql.cursors.DictCursor
+        )
+        cursor = conn.cursor()
+        
+        # Create backup of current state before making changes
+        backup = {
+            'students': [],
+            'mentors': [],
+            'internships': [],
+            'mentor_assignments': []
+        }
+        
+        # Backup existing student data
+        cursor.execute("SELECT * FROM students")
+        backup['students'] = cursor.fetchall()
+        
+        # Backup existing mentor data
+        cursor.execute("SELECT * FROM mentors")
+        backup['mentors'] = cursor.fetchall()
+        
+        # Backup existing internship data
+        cursor.execute("SELECT * FROM internships")
+        backup['internships'] = cursor.fetchall()
+        
+        # Backup existing mentor assignments
+        cursor.execute("SELECT * FROM mentor_assignments")
+        backup['mentor_assignments'] = cursor.fetchall()
+        
+        result = {
+            'fixed_users': 0,
+            'fixed_students': 0,
+            'fixed_mentors': 0,
+            'fixed_internships': 0,
+            'fixed_assignments': 0,
+            'backup': backup
+        }
+        
+        # Get all users
+        cursor.execute("SELECT * FROM users")
+        all_users = cursor.fetchall()
+        
+        student_users = [u for u in all_users if u['role'] == 'student']
+        mentor_users = [u for u in all_users if u['role'] == 'mentor']
+        
+        # Fix student records
+        for user in student_users:
+            user_id = user['id']
+            cursor.execute("SELECT * FROM students WHERE user_id = %s", (user_id,))
+            existing_student = cursor.fetchone()
+            
+            if not existing_student:
+                # Create a new student record with proper information
+                email = user['email']
+                name = email.split('@')[0].replace('.', ' ').title()
+                # Generate a stable registration number based on email to ensure consistency
+                reg_number = f"R{hash(email) % 100000:05d}"
+                batch = "2023"
+                
+                cursor.execute("""
+                    INSERT INTO students (user_id, name, registration_number, batch)
+                    VALUES (%s, %s, %s, %s)
+                """, (user_id, name, reg_number, batch))
+                
+                result['fixed_students'] += 1
+                print(f"Created new student record for user {user_id} ({email})")
+        
+        # Fix mentor records
+        for user in mentor_users:
+            user_id = user['id']
+            cursor.execute("SELECT * FROM mentors WHERE user_id = %s", (user_id,))
+            existing_mentor = cursor.fetchone()
+            
+            if not existing_mentor:
+                # Create a new mentor record with proper information
+                email = user['email']
+                name = email.split('@')[0].replace('.', ' ').title()
+                department = "Computer Science"
+                designation = "Assistant Professor"
+                max_students = 5
+                
+                cursor.execute("""
+                    INSERT INTO mentors (user_id, name, department, designation, max_students)
+                    VALUES (%s, %s, %s, %s, %s)
+                """, (user_id, name, department, designation, max_students))
+                
+                result['fixed_mentors'] += 1
+                print(f"Created new mentor record for user {user_id} ({email})")
+        
+        # Restore mentor assignments
+        # First, get current student IDs
+        cursor.execute("SELECT id, user_id FROM students")
+        student_map = {s['user_id']: s['id'] for s in cursor.fetchall()}
+        
+        # Get current mentor IDs
+        cursor.execute("SELECT id, user_id FROM mentors")
+        mentor_map = {m['user_id']: m['id'] for m in cursor.fetchall()}
+        
+        # Check for unassigned students
+        cursor.execute("""
+            SELECT s.id, s.user_id FROM students s
+            LEFT JOIN mentor_assignments ma ON s.id = ma.student_id
+            WHERE ma.id IS NULL
+        """)
+        unassigned_students = cursor.fetchall()
+        
+        if unassigned_students and mentor_map:
+            mentor_ids = list(mentor_map.values())
+            # Assign students to mentors (distributing evenly)
+            for i, student in enumerate(unassigned_students):
+                mentor_id = mentor_ids[i % len(mentor_ids)]
+                try:
+                    cursor.execute("""
+                        INSERT INTO mentor_assignments (registration_number, mentor_id)
+                        VALUES (%s, %s)
+                    """, (student['registration_number'], mentor_id))
+                    result['fixed_assignments'] += 1
+                    print(f"Assigned student {student['id']} to mentor {mentor_id}")
+                except Exception as e:
+                    print(f"Failed to assign student {student['id']} to mentor {mentor_id}: {str(e)}")
+        
+        # Fix internships: Restore any lost internship data from backup
+        if backup['internships']:
+            for internship in backup['internships']:
+                # Check if this internship is still assigned to a student
+                student_id = internship.get('student_id')
+                if student_id:
+                    cursor.execute("SELECT * FROM internships WHERE registration_number = (SELECT registration_number FROM students WHERE id = %s)", (student_id,))
+                    existing_internship = cursor.fetchone()
+                    
+                    if not existing_internship:
+                        # Restore this internship with student details
+                        try:
+                            # Get student details
+                            cursor.execute("SELECT name, registration_number FROM students WHERE id = %s", (student_id,))
+                            student = cursor.fetchone()
+                            
+                            if student:
+                                fields = ['name', 'registration_number']
+                                values = [student['name'], student['registration_number']]
+                                placeholders = ['%s', '%s']
+                                
+                                for key, value in internship.items():
+                                    if key not in ['id', 'student_id'] and key not in fields:  # Skip id, student_id, and already added fields
+                                        fields.append(key)
+                                        values.append(value)
+                                        placeholders.append('%s')
+                                
+                                query = f"INSERT INTO internships ({', '.join(fields)}) VALUES ({', '.join(placeholders)})"
+                                cursor.execute(query, values)
+                                result['fixed_internships'] += 1
+                                print(f"Restored internship for student {student['name']} ({student['registration_number']})")
+                        except Exception as e:
+                            print(f"Failed to restore internship: {str(e)}")
+        
+        # Commit changes
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        return jsonify({
+            'message': f'Recovery complete.',
+            'details': result
+        })
+        
+    except Exception as e:
+        if 'conn' in locals() and conn:
+            conn.rollback()
+            conn.close()
+        
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+@bp.route('/student/export/<registration_number>', methods=['GET'])
+@admin_required
+def export_student_data(registration_number):
+    """Export complete student data including parent and alumni information"""
+    try:
+        # Get format parameter (default to JSON)
+        format_type = request.args.get('format', 'json')
+        
+        # Fetch student data
+        student = Student.query.filter_by(registration_number=registration_number).first()
+        if not student:
+            return jsonify({"error": "Student not found"}), 404
+        
+        # Get related data from Parent and AlumniRelation tables
+        from models.parent import Parent
+        from models.alumni_relation import AlumniRelation
+        
+        parent = Parent.query.filter_by(registration_number=registration_number).first()
+        alumni = None
+        if student.has_muj_alumni:
+            alumni = AlumniRelation.query.filter_by(registration_number=registration_number).first()
+        
+        # Get internship data
+        internship = Internship.query.filter_by(registration_number=registration_number).first()
+        
+        # Combine data in the format needed for the form
+        combined_data = {
+            "student": student.to_dict(),
+            "parent": parent.to_dict() if parent else None,
+            "alumni_relation": alumni.to_dict() if alumni else None,
+            "internship": internship.to_dict() if internship else None
+        }
+        
+        # Return as JSON
+        if format_type == 'json':
+            return jsonify(combined_data)
+        
+        # For CSV/Excel formats, we'd need additional libraries like pandas
+        # This would be implemented based on specific requirements
+        elif format_type in ['csv', 'excel']:
+            return jsonify({"error": f"Export as {format_type} not yet implemented"}), 501
+        
+        return jsonify({"error": "Invalid format type"}), 400
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+@bp.route('/students/export', methods=['GET'])
+@admin_required
+def export_all_students_data():
+    """Export data for all students including parent and alumni information"""
+    try:
+        # Get format parameter (default to JSON)
+        format_type = request.args.get('format', 'json')
+        
+        # Fetch all students
+        students = Student.query.all()
+        if not students:
+            return jsonify({"message": "No students found", "data": []}), 200
+        
+        # Import models
+        from models.parent import Parent
+        from models.alumni_relation import AlumniRelation
+        
+        # Prepare data for each student
+        students_data = []
+        for student in students:
+            # Get related data
+            parent = Parent.query.filter_by(registration_number=student.registration_number).first()
+            alumni = None
+            if student.has_muj_alumni:
+                alumni = AlumniRelation.query.filter_by(registration_number=student.registration_number).first()
+            
+            # Get internship data
+            internship = Internship.query.filter_by(registration_number=student.registration_number).first()
+            
+            # Combine student data
+            student_data = {
+                "student": student.to_dict(),
+                "parent": parent.to_dict() if parent else None,
+                "alumni_relation": alumni.to_dict() if alumni else None,
+                "internship": internship.to_dict() if internship else None
+            }
+            
+            students_data.append(student_data)
+        
+        # Return as JSON
+        if format_type == 'json':
+            return jsonify({"students": students_data})
+        
+        # For CSV/Excel formats, we'd need additional libraries like pandas
+        # This would be implemented based on specific requirements
+        elif format_type in ['csv', 'excel']:
+            return jsonify({"error": f"Export as {format_type} not yet implemented"}), 501
+        
+        return jsonify({"error": "Invalid format type"}), 400
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+@bp.route('/students/unassigned', methods=['GET'])
+@admin_required
+def get_unassigned_students():
+    """Get all students who don't have an assigned mentor"""
+    try:
+        # Use direct database access for efficiency
+        conn = pymysql.connect(
+            host='localhost',
+            user='root',
+            password='yoyobheemsa',
+            database='internship_portal',
+            cursorclass=pymysql.cursors.DictCursor
+        )
+        cursor = conn.cursor()
+        
+        # Query for students without mentors
+        cursor.execute("""
+            SELECT s.id, s.name, s.registration_number, s.department, s.batch
+            FROM students s
+            LEFT JOIN mentor_assignments ma ON s.registration_number = ma.registration_number
+            WHERE ma.id IS NULL
+            ORDER BY s.name
+        """)
+        
+        students = cursor.fetchall()
+        
+        # Count internships for each student
+        for student in students:
+            cursor.execute("""
+                SELECT COUNT(*) as count
+                FROM internships
+                WHERE registration_number = %s
+            """, (student['registration_number'],))
+            internship_count = cursor.fetchone()['count']
+            student['has_internship'] = internship_count > 0
+        
+        cursor.close()
+        conn.close()
+        
+        return jsonify({
+            'students': students,
+            'count': len(students)
+        })
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+@bp.route('/assign-mentor/bulk', methods=['POST'])
+@admin_required
+def assign_mentor_bulk():
+    """Assign multiple students to a mentor"""
+    try:
+        data = request.get_json()
+        
+        # Validate input data
+        if not data or 'student_ids' not in data or 'mentor_id' not in data:
+            return jsonify({'error': 'Missing required fields: student_ids and mentor_id'}), 400
+        
+        student_ids = data['student_ids']
+        mentor_id = data['mentor_id']
+        
+        if not isinstance(student_ids, list) or len(student_ids) == 0:
+            return jsonify({'error': 'student_ids must be a non-empty list'}), 400
+        
+        print(f"Admin is bulk assigning mentor {mentor_id} to {len(student_ids)} students")
+        
+        # Connect to database
+        conn = pymysql.connect(
+            host='localhost',
+            user='root',
+            password='yoyobheemsa',
+            database='internship_portal',
+            cursorclass=pymysql.cursors.DictCursor
+        )
+        cursor = conn.cursor()
+        
+        # Check if mentor exists
+        cursor.execute("SELECT id, name, max_students FROM mentors WHERE id = %s", (mentor_id,))
+        mentor = cursor.fetchone()
+        if not mentor:
+            conn.close()
+            return jsonify({'error': 'Mentor not found'}), 404
+        
+        # Check if mentor has enough capacity
+        max_students = mentor['max_students'] if mentor['max_students'] else 5  # Default to 5 if not set
+        
+        cursor.execute("SELECT COUNT(*) as count FROM mentor_assignments WHERE mentor_id = %s", (mentor_id,))
+        current_students = cursor.fetchone()['count']
+        
+        remaining_capacity = max_students - current_students
+        if remaining_capacity < len(student_ids):
+            conn.close()
+            return jsonify({
+                'error': f'Mentor can only accept {remaining_capacity} more students (has {current_students}/{max_students})',
+                'max_students': max_students,
+                'current_students': current_students,
+                'requested': len(student_ids)
+            }), 400
+        
+        # Process each student
+        success_count = 0
+        failed_students = []
+        
+        for student_id in student_ids:
+            try:
+                # Check if student exists
+                cursor.execute("SELECT id, registration_number, name FROM students WHERE id = %s", (student_id,))
+                student = cursor.fetchone()
+                if not student:
+                    failed_students.append({
+                        'id': student_id,
+                        'reason': 'Student not found'
+                    })
+                    continue
+                
+                registration_number = student['registration_number']
+                
+                # Check if student already has a mentor
+                cursor.execute("SELECT mentor_id FROM mentor_assignments WHERE registration_number = %s", (registration_number,))
+                existing_assignment = cursor.fetchone()
+                
+                if existing_assignment:
+                    if existing_assignment['mentor_id'] == mentor_id:
+                        # Already assigned to this mentor, count as success
+                        success_count += 1
+                        continue
+                    
+                    # Update existing assignment
+                    cursor.execute("""
+                        UPDATE mentor_assignments 
+                        SET mentor_id = %s 
+                        WHERE registration_number = %s
+                    """, (mentor_id, registration_number))
+                else:
+                    # Create new assignment
+                    cursor.execute("""
+                        INSERT INTO mentor_assignments (registration_number, mentor_id)
+                        VALUES (%s, %s)
+                    """, (registration_number, mentor_id))
+                
+                # Update any internships for this student
+                cursor.execute("""
+                    UPDATE internships 
+                    SET mentor_id = %s 
+                    WHERE registration_number = %s AND (mentor_id IS NULL OR mentor_id != %s)
+                """, (mentor_id, registration_number, mentor_id))
+                
+                success_count += 1
+                
+            except Exception as e:
+                failed_students.append({
+                    'id': student_id,
+                    'reason': str(e)
+                })
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        return jsonify({
+            'message': f'Successfully assigned {success_count} students to mentor {mentor["name"]}',
+            'success_count': success_count,
+            'failed_count': len(failed_students),
+            'failed_students': failed_students
+        })
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+@bp.route('/students', methods=['POST'])
+@admin_required
+def create_student():
+    try:
+        data = request.get_json()
+        
+        # Check required fields
+        if not all(k in data for k in ['name', 'email', 'registration_number', 'batch']):
+            return jsonify({'error': 'Missing required fields'}), 400
+        
+        # First check if user with this email already exists
+        existing_user = User.query.filter_by(email=data['email']).first()
+        
+        # User exists
+        if existing_user:
+            # Check if this user already has a student profile
+            existing_student = Student.query.filter_by(user_id=existing_user.id).first()
+            
+            if existing_student:
+                return jsonify({"error": "A student with this email already exists."}), 400
+            else:
+                # User exists but no student profile - create student profile
+                student = Student(
+                    user_id=existing_user.id,
+                    name=data['name'],
+                    registration_number=data['registration_number'],
+                    batch=data['batch'],
+                    program=data.get('program', ''),
+                    section=data.get('section', '')
+                )
+                db.session.add(student)
+                db.session.commit()
+                
+                return jsonify({
+                    "message": "Student profile created for existing user.",
+                    "student": {
+                        "id": student.id,
+                        "name": student.name,
+                        "email": existing_user.email,
+                        "registration_number": student.registration_number,
+                        "batch": student.batch
+                    }
+                }), 201
+        else:
+            # Check if registration number is already in use
+            existing_student = Student.query.filter_by(registration_number=data['registration_number']).first()
+            if existing_student:
+                return jsonify({'error': 'Registration number already in use'}), 400
+                
+            # No existing user - create new user first
+            user = User(
+                email=data['email'],
+                role='student'
+            )
+            # Set a default password
+            password = data.get('password', 'changeme123')
+            user.set_password(password)
+            
+            db.session.add(user)
+            db.session.flush()  # Get the user ID
+            
+            # Create new student
+            student = Student(
+                user_id=user.id,
+                name=data['name'],
+                registration_number=data['registration_number'],
+                batch=data['batch'],
+                program=data.get('program', ''),
+                section=data.get('section', '')
+            )
+            
+            db.session.add(student)
+            db.session.commit()
+            
+            # If mentor_id is provided, assign student to mentor
+            mentor_id = data.get('mentor_id')
+            if mentor_id:
+                mentor = Mentor.query.get(mentor_id)
+                if mentor:
+                    assignment = MentorAssignment(
+                        mentor_id=mentor_id,
+                        student_id=student.id
+                    )
+                    db.session.add(assignment)
+                    db.session.commit()
+            
+            return jsonify({
+                'message': 'Student created successfully',
+                'student': {
+                    'id': student.id,
+                    'name': student.name,
+                    'email': user.email,
+                    'registration_number': student.registration_number,
+                    'batch': student.batch,
+                    'password': password  # Include password for admin to share
+                }
+            }), 201
+    except Exception as e:
+        db.session.rollback()
+        print(f"Error creating student: {str(e)}")
+        return jsonify({"error": f"Failed to create student: {str(e)}"}), 500 

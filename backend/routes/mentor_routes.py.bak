@@ -1,0 +1,1587 @@
+from flask import Blueprint, request, jsonify, g
+from flask_jwt_extended import get_jwt_identity
+from functools import wraps
+from models.user import User
+from models.student import Student
+from models.mentor import Mentor
+from models.internship import Internship
+from models.mentor_assignment import MentorAssignment
+from models.evaluation import Evaluation
+from extensions import db
+from utils.access_control import mentor_required, token_required
+from flask_cors import cross_origin
+import datetime
+import pymysql
+import sys
+
+bp = Blueprint('mentor', __name__, url_prefix='/mentor')
+
+@bp.route('/dashboard', methods=['GET'])
+@token_required
+@cross_origin(origins="*")
+def mentor_dashboard():
+    # Get user ID from token data
+    user_id = request.token_data['user_id']
+    role = request.token_data['role']
+    
+    # Check if user has mentor role
+    if role != 'mentor':
+        return jsonify({'error': 'Mentor access required'}), 403
+    
+    # Find mentor profile
+    try:
+        conn = pymysql.connect(
+            host='localhost',
+            user='root',
+            password='yoyobheemsa',
+            database='internship_portal'
+        )
+        
+        cursor = conn.cursor(pymysql.cursors.DictCursor)
+        cursor.execute("SELECT * FROM mentors WHERE user_id = %s", (user_id,))
+        mentor = cursor.fetchone()
+        
+        if not mentor:
+            cursor.close()
+            conn.close()
+            return jsonify({'error': 'Mentor profile not found'}), 404
+        
+        # Get email from User model
+        cursor.execute("SELECT email FROM users WHERE id = %s", (user_id,))
+        user = cursor.fetchone()
+        
+        cursor.close()
+        conn.close()
+        
+        return jsonify({
+            'mentor': {
+                'id': mentor['id'],
+                'user_id': user_id,
+                'name': mentor['name'],
+                'email': user['email'] if user else None,
+                'department': mentor['department']
+            }
+        }), 200
+    
+    except Exception as e:
+        print(f"Error in mentor dashboard: {str(e)}")
+        return jsonify({'error': f'Failed to fetch mentor dashboard: {str(e)}'}), 500
+
+@bp.route('/students', methods=['GET'])
+@mentor_required
+def get_assigned_students():
+    try:
+        mentor = Mentor.query.filter_by(user_id=g.user.id).first()
+        if not mentor:
+            return jsonify({'error': 'Mentor not found'}), 404
+
+        # Get all students assigned to this mentor
+        students = Student.query.filter_by(mentor_id=mentor.id).all()
+        
+        students_data = []
+        for student in students:
+            # Get internship details if available
+            internship = Internship.query.filter_by(registration_number=student.registration_number).first()
+            
+            # Get latest progress
+            latest_progress = Progress.query.filter_by(
+                registration_number=student.registration_number
+            ).order_by(Progress.updated_at.desc()).first()
+            
+            # Calculate overall progress
+            progress_entries = Progress.query.filter_by(
+                registration_number=student.registration_number
+            ).all()
+            
+            overall_progress = 0
+            if progress_entries:
+                total = len(progress_entries) * 100
+                completed = sum(entry.completion_percentage for entry in progress_entries)
+                overall_progress = int((completed / total) * 100) if total > 0 else 0
+            
+            # Get latest evaluation
+            latest_evaluation = Evaluation.query.filter_by(
+                registration_number=student.registration_number,
+                mentor_id=mentor.id
+            ).order_by(Evaluation.submitted_at.desc()).first()
+            
+            students_data.append({
+                'id': student.id,
+                'name': student.name,
+                'registration_number': student.registration_number,
+                'batch': student.batch,
+                'department': student.department,
+                'internship': {
+                    'company': internship.company_name if internship else None,
+                    'type': internship.internship_type if internship else None,
+                    'approved': internship.mentor_approval if internship else False
+                } if internship else None,
+                'progress': {
+                    'overall': overall_progress,
+                    'latest': latest_progress.to_dict() if latest_progress else None
+                },
+                'evaluation': latest_evaluation.to_dict() if latest_evaluation else None
+            })
+            
+        return jsonify(students_data), 200
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
+
+@bp.route('/student/<registration_number>', methods=['GET'])
+@mentor_required
+def get_student_detail(registration_number):
+    try:
+        mentor = Mentor.query.filter_by(user_id=g.user.id).first()
+        if not mentor:
+            return jsonify({'error': 'Mentor not found'}), 404
+            
+        # Get student details
+        student = Student.query.filter_by(registration_number=registration_number).first()
+        if not student:
+            return jsonify({'error': 'Student not found'}), 404
+            
+        # Check if this mentor is assigned to the student
+        if student.mentor_id != mentor.id:
+            return jsonify({'error': 'You are not assigned as a mentor to this student'}), 403
+            
+        # Get internship details
+        internship = Internship.query.filter_by(registration_number=registration_number).first()
+        
+        # Get all evaluations
+        evaluations = Evaluation.query.filter_by(
+            registration_number=registration_number,
+            mentor_id=mentor.id
+        ).order_by(Evaluation.submitted_at.desc()).all()
+        
+        # Get all weekly reports
+        weekly_reports = WeeklyReport.query.filter_by(
+            registration_number=registration_number
+        ).order_by(WeeklyReport.week_number.desc()).all()
+        
+        # Get all feedback
+        feedback = MentorFeedback.query.filter_by(
+            registration_number=registration_number,
+            mentor_id=mentor.id
+        ).order_by(MentorFeedback.created_at.desc()).all()
+        
+        # Get progress data
+        progress_entries = Progress.query.filter_by(
+            registration_number=registration_number
+        ).order_by(Progress.week.desc()).all()
+        
+        # Calculate overall progress
+        overall_progress = 0
+        if progress_entries:
+            total = len(progress_entries) * 100
+            completed = sum(entry.completion_percentage for entry in progress_entries)
+            overall_progress = int((completed / total) * 100) if total > 0 else 0
+            
+        user = User.query.get(student.user_id)
+        
+        student_data = {
+            'id': student.id,
+            'name': student.name,
+            'registration_number': student.registration_number,
+            'batch': student.batch,
+            'department': student.department,
+            'email': user.email if user else None,
+            'phone': student.phone,
+            'address': student.address,
+            'internship': internship.to_dict() if internship else None,
+            'evaluations': [eval.to_dict() for eval in evaluations],
+            'weekly_reports': [report.to_dict() for report in weekly_reports],
+            'feedback': [f.to_dict() for f in feedback],
+            'progress': {
+                'overall': overall_progress,
+                'entries': [entry.to_dict() for entry in progress_entries]
+            }
+        }
+            
+        return jsonify(student_data), 200
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
+
+@bp.route('/feedback/submit', methods=['POST'])
+@mentor_required
+def submit_feedback():
+    try:
+        mentor = Mentor.query.filter_by(user_id=g.user.id).first()
+        if not mentor:
+            return jsonify({'error': 'Mentor not found'}), 404
+            
+        data = request.get_json()
+        
+        # Validate required fields
+        required_fields = ['registration_number', 'feedback_text', 'rating', 'title']
+        if not all(field in data for field in required_fields):
+            return jsonify({'error': 'Missing required fields', 'required': required_fields}), 400
+            
+        # Check rating range
+        rating = int(data['rating'])
+        if rating < 1 or rating > 5:
+            return jsonify({'error': 'Rating must be between 1 and 5'}), 400
+            
+        # Get student details
+        student = Student.query.filter_by(registration_number=data['registration_number']).first()
+        if not student:
+            return jsonify({'error': 'Student not found'}), 404
+            
+        # Check if this mentor is assigned to the student
+        if student.mentor_id != mentor.id:
+            return jsonify({'error': 'You are not assigned as a mentor to this student'}), 403
+            
+        # Create feedback
+        feedback = MentorFeedback(
+            mentor_id=mentor.id,
+            registration_number=data['registration_number'],
+            title=data['title'],
+            feedback_text=data['feedback_text'],
+            rating=rating,
+            category=data.get('category'),
+            improvement_areas=data.get('improvement_areas'),
+            strengths=data.get('strengths')
+        )
+        
+        db.session.add(feedback)
+        db.session.commit()
+        
+        return jsonify({
+            'message': 'Feedback submitted successfully',
+            'feedback': feedback.to_dict()
+        }), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
+@bp.route('/evaluation/submit', methods=['POST'])
+@mentor_required
+def submit_evaluation():
+    try:
+        mentor = Mentor.query.filter_by(user_id=g.user.id).first()
+        if not mentor:
+            return jsonify({'error': 'Mentor not found'}), 404
+            
+        data = request.get_json()
+        
+        # Validate required fields
+        required_fields = ['registration_number', 'evaluation_type', 'marks']
+        if not all(field in data for field in required_fields):
+            return jsonify({'error': 'Missing required fields', 'required': required_fields}), 400
+            
+        # Get student details
+        student = Student.query.filter_by(registration_number=data['registration_number']).first()
+        if not student:
+            return jsonify({'error': 'Student not found'}), 404
+            
+        # Check if this mentor is assigned to the student
+        if student.mentor_id != mentor.id:
+            return jsonify({'error': 'You are not assigned as a mentor to this student'}), 403
+            
+        # Create evaluation
+        evaluation = Evaluation(
+            mentor_id=mentor.id,
+            registration_number=data['registration_number'],
+            evaluation_type=data['evaluation_type'],
+            marks=float(data['marks']),
+            feedback=data.get('feedback'),
+            remarks=data.get('remarks')
+        )
+        
+        db.session.add(evaluation)
+        db.session.commit()
+        
+        return jsonify({
+            'message': 'Evaluation submitted successfully',
+            'evaluation': evaluation.to_dict()
+        }), 201
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
+@bp.route('/progress/update', methods=['POST'])
+@mentor_required
+def update_progress():
+    try:
+        mentor = Mentor.query.filter_by(user_id=g.user.id).first()
+        if not mentor:
+            return jsonify({'error': 'Mentor not found'}), 404
+            
+        data = request.get_json()
+        
+        # Validate required fields
+        required_fields = ['registration_number', 'phase', 'week', 'completion_percentage', 'status']
+        if not all(field in data for field in required_fields):
+            return jsonify({'error': 'Missing required fields', 'required': required_fields}), 400
+            
+        # Get student details
+        student = Student.query.filter_by(registration_number=data['registration_number']).first()
+        if not student:
+            return jsonify({'error': 'Student not found'}), 404
+            
+        # Check if this mentor is assigned to the student
+        if student.mentor_id != mentor.id:
+            return jsonify({'error': 'You are not assigned as a mentor to this student'}), 403
+            
+        # Check if progress entry exists
+        progress = Progress.query.filter_by(
+            registration_number=data['registration_number'],
+            phase=data['phase'],
+            week=int(data['week'])
+        ).first()
+        
+        if progress:
+            # Update existing progress
+            progress.completion_percentage = int(data['completion_percentage'])
+            progress.status = data['status']
+        else:
+            # Create new progress entry
+            progress = Progress(
+                registration_number=data['registration_number'],
+                phase=data['phase'],
+                week=int(data['week']),
+                completion_percentage=int(data['completion_percentage']),
+                status=data['status']
+            )
+            db.session.add(progress)
+            
+        db.session.commit()
+        
+        return jsonify({
+            'message': 'Progress updated successfully',
+            'progress': progress.to_dict()
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
+@bp.route('/student/<registration_number>/reports', methods=['GET'])
+@token_required
+@cross_origin(origins="*")
+def get_student_reports(registration_number):
+    """Get all reports submitted by a specific student"""
+    try:
+        user_id = request.token_data['user_id']
+        role = request.token_data['role']
+        
+        # Check if user has mentor role
+        if role != 'mentor':
+            return jsonify({'error': 'Mentor access required'}), 403
+        
+        conn = pymysql.connect(
+            host='localhost',
+            user='root',
+            password='yoyobheemsa',
+            database='internship_portal'
+        )
+        
+        cursor = conn.cursor(pymysql.cursors.DictCursor)
+        
+        # Find mentor profile
+        cursor.execute("SELECT * FROM mentors WHERE user_id = %s", (user_id,))
+        mentor = cursor.fetchone()
+        
+        if not mentor:
+            cursor.close()
+            conn.close()
+            return jsonify({"message": "Mentor profile not found."}), 404
+        
+        # Check if this student is assigned to this mentor
+        cursor.execute("""
+            SELECT * FROM mentor_assignments 
+            WHERE mentor_id = %s AND registration_number = %s
+        """, (mentor['id'], registration_number))
+        
+        assignment = cursor.fetchone()
+        if not assignment:
+            cursor.close()
+            conn.close()
+            return jsonify({"message": "This student is not assigned to you."}), 403
+        
+        # Get all reports for this student
+        cursor.execute("""
+            SELECT * FROM reports
+            WHERE student_id = %s
+            ORDER BY submission_date DESC
+        """, (registration_number,))
+        
+        reports = cursor.fetchall()
+        
+        cursor.close()
+        conn.close()
+        
+        return jsonify({"reports": reports}), 200
+        
+    except Exception as e:
+        print(f"Error getting student reports: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"message": f"Failed to get student reports: {str(e)}"}), 500
+
+@bp.route('/evaluations/<registration_number>', methods=['GET'])
+@token_required
+@cross_origin(origins="*")
+def get_student_evaluations(registration_number):
+    """Get all evaluations for a specific student"""
+    try:
+        user_id = request.token_data['user_id']
+        role = request.token_data['role']
+        
+        # Check if user has mentor role
+        if role != 'mentor':
+            return jsonify({'error': 'Mentor access required'}), 403
+        
+        conn = pymysql.connect(
+            host='localhost',
+            user='root',
+            password='yoyobheemsa',
+            database='internship_portal'
+        )
+        
+        cursor = conn.cursor(pymysql.cursors.DictCursor)
+        
+        # Find mentor profile
+        cursor.execute("SELECT * FROM mentors WHERE user_id = %s", (user_id,))
+        mentor = cursor.fetchone()
+        
+        if not mentor:
+            cursor.close()
+            conn.close()
+            return jsonify({"message": "Mentor profile not found."}), 404
+        
+        # Check if this student is assigned to this mentor
+        cursor.execute("""
+            SELECT * FROM mentor_assignments 
+            WHERE mentor_id = %s AND registration_number = %s
+        """, (mentor['id'], registration_number))
+        
+        assignment = cursor.fetchone()
+        if not assignment:
+            cursor.close()
+            conn.close()
+            return jsonify({"message": "You are not authorized to view this student's evaluations."}), 403
+        
+        # Get all evaluations for this student
+        cursor.execute("""
+            SELECT * FROM evaluations
+            WHERE registration_number = %s AND mentor_id = %s
+            ORDER BY submitted_at DESC
+        """, (registration_number, mentor['id']))
+        
+        evaluations = cursor.fetchall()
+        
+        cursor.close()
+        conn.close()
+        
+        return jsonify({"evaluations": evaluations}), 200
+        
+    except Exception as e:
+        print(f"Error getting student evaluations: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"message": f"Failed to get student evaluations: {str(e)}"}), 500
+
+@bp.route('/evaluate/<registration_number>', methods=['POST'])
+@token_required
+@cross_origin(origins="*")
+def evaluate_student(registration_number):
+    """Create a new evaluation for a student"""
+    try:
+        user_id = request.token_data['user_id']
+        role = request.token_data['role']
+        
+        # Check if user has mentor role
+        if role != 'mentor':
+            return jsonify({'error': 'Mentor access required'}), 403
+            
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+            
+        # Validate required fields
+        required_fields = ['evaluation_type', 'marks']
+        for field in required_fields:
+            if field not in data:
+                return jsonify({'error': f'Missing required field: {field}'}), 400
+                
+        # Connect to database
+        conn = pymysql.connect(
+            host='localhost',
+            user='root',
+            password='yoyobheemsa',
+            database='internship_portal'
+        )
+        
+        cursor = conn.cursor(pymysql.cursors.DictCursor)
+        
+        # Find mentor profile
+        cursor.execute("SELECT * FROM mentors WHERE user_id = %s", (user_id,))
+        mentor = cursor.fetchone()
+        
+        if not mentor:
+            cursor.close()
+            conn.close()
+            return jsonify({"message": "Mentor profile not found."}), 404
+            
+        # Find student
+        cursor.execute("SELECT * FROM students WHERE registration_number = %s", (registration_number,))
+        student = cursor.fetchone()
+        
+        if not student:
+            cursor.close()
+            conn.close()
+            return jsonify({"message": "Student not found."}), 404
+            
+        # Check if student is assigned to this mentor
+        cursor.execute("""
+            SELECT * FROM mentor_assignments 
+            WHERE mentor_id = %s AND registration_number = %s
+        """, (mentor['id'], registration_number))
+        
+        assignment = cursor.fetchone()
+        if not assignment:
+            cursor.close()
+            conn.close()
+            return jsonify({"message": "This student is not assigned to you."}), 403
+            
+        # Validate marks
+        try:
+            marks = float(data['marks'])
+            if marks < 0 or marks > 100:
+                return jsonify({'error': 'Marks must be between 0 and 100'}), 400
+        except ValueError:
+            return jsonify({'error': 'Marks must be a number'}), 400
+            
+        # Insert evaluation
+        eval_data = {
+            'registration_number': registration_number,
+            'mentor_id': mentor['id'],
+            'evaluation_type': data['evaluation_type'],
+            'marks': marks,
+            'feedback': data.get('feedback', ''),
+            'remarks': data.get('remarks', ''),
+            'submitted_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+        
+        # Create evaluation
+        cursor.execute("""
+            INSERT INTO evaluations
+            (registration_number, mentor_id, evaluation_type, marks, feedback, remarks, submitted_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """, (
+            eval_data['registration_number'],
+            eval_data['mentor_id'],
+            eval_data['evaluation_type'],
+            eval_data['marks'],
+            eval_data['feedback'],
+            eval_data['remarks'],
+            eval_data['submitted_at']
+        ))
+        
+        evaluation_id = cursor.lastrowid
+        
+        # If this is a report evaluation, update the report
+        if 'report_id' in data and data['report_id']:
+            cursor.execute("""
+                UPDATE reports
+                SET marks = %s, remarks = %s
+                WHERE id = %s AND student_id = %s
+            """, (
+                eval_data['marks'],
+                eval_data['remarks'],
+                data['report_id'],
+                student['id']
+            ))
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        return jsonify({
+            "message": "Evaluation submitted successfully",
+            "evaluation_id": evaluation_id
+        }), 200
+        
+    except Exception as e:
+        print(f"Error evaluating student: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"message": f"Failed to submit evaluation: {str(e)}"}), 500
+
+@bp.route('/student/<registration_number>/weekly-feedback', methods=['GET'])
+@token_required
+@cross_origin(origins="*")
+def get_weekly_feedback(registration_number):
+    """Get all weekly feedback for a specific student"""
+    try:
+        user_id = request.token_data['user_id']
+        role = request.token_data['role']
+        
+        # Check if user has mentor role
+        if role != 'mentor':
+            return jsonify({'error': 'Mentor access required'}), 403
+        
+        conn = pymysql.connect(
+            host='localhost',
+            user='root',
+            password='yoyobheemsa',
+            database='internship_portal'
+        )
+        
+        cursor = conn.cursor(pymysql.cursors.DictCursor)
+        
+        # Find mentor profile
+        cursor.execute("SELECT * FROM mentors WHERE user_id = %s", (user_id,))
+        mentor = cursor.fetchone()
+        
+        if not mentor:
+            cursor.close()
+            conn.close()
+            return jsonify({"message": "Mentor profile not found."}), 404
+        
+        # Check if this student is assigned to this mentor
+        cursor.execute("""
+            SELECT * FROM mentor_assignments 
+            WHERE mentor_id = %s AND registration_number = %s
+        """, (mentor['id'], registration_number))
+        
+        assignment = cursor.fetchone()
+        if not assignment:
+            cursor.close()
+            conn.close()
+            return jsonify({"message": "This student is not assigned to you."}), 403
+        
+        # Get all weekly feedback for this student
+        cursor.execute("""
+            SELECT * FROM weekly_feedback
+            WHERE registration_number = %s AND mentor_id = %s
+            ORDER BY week DESC
+        """, (registration_number, mentor['id']))
+        
+        feedback = cursor.fetchall()
+        
+        cursor.close()
+        conn.close()
+        
+        return jsonify({"feedback": feedback}), 200
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"message": f"Failed to get weekly feedback: {str(e)}"}), 500
+
+@bp.route('/student/<registration_number>/progress', methods=['GET'])
+@token_required
+@cross_origin(origins="*")
+def get_student_progress(registration_number):
+    """Get progress data for a specific student"""
+    try:
+        user_id = request.token_data['user_id']
+        role = request.token_data['role']
+        
+        # Check if user has mentor role
+        if role != 'mentor':
+            return jsonify({'error': 'Mentor access required'}), 403
+        
+        conn = pymysql.connect(
+            host='localhost',
+            user='root',
+            password='yoyobheemsa',
+            database='internship_portal'
+        )
+        
+        cursor = conn.cursor(pymysql.cursors.DictCursor)
+        
+        # Find mentor profile
+        cursor.execute("SELECT * FROM mentors WHERE user_id = %s", (user_id,))
+        mentor = cursor.fetchone()
+        
+        if not mentor:
+            cursor.close()
+            conn.close()
+            return jsonify({"message": "Mentor profile not found."}), 404
+        
+        # Check if this student is assigned to this mentor
+        cursor.execute("""
+            SELECT * FROM mentor_assignments 
+            WHERE mentor_id = %s AND registration_number = %s
+        """, (mentor['id'], registration_number))
+        
+        assignment = cursor.fetchone()
+        if not assignment:
+            cursor.close()
+            conn.close()
+            return jsonify({"message": "This student is not assigned to you."}), 403
+        
+        # Get student details
+        cursor.execute("SELECT * FROM students WHERE registration_number = %s", (registration_number,))
+        student = cursor.fetchone()
+        
+        if not student:
+            cursor.close()
+            conn.close()
+            return jsonify({"message": "Student not found."}), 404
+        
+        # Get internship details to determine total duration
+        cursor.execute("SELECT * FROM internships WHERE registration_number = %s", (registration_number,))
+        internship = cursor.fetchone()
+        
+        if not internship:
+            cursor.close()
+            conn.close()
+            return jsonify({"message": "Internship not found."}), 404
+        
+        # Get all progress entries for this student
+        cursor.execute("""
+            SELECT * FROM progress
+            WHERE registration_number = %s
+            ORDER BY phase, week
+        """, (registration_number,))
+        
+        progress_entries = cursor.fetchall()
+        
+        # Group progress by phase
+        progress_by_phase = {}
+        for entry in progress_entries:
+            phase = entry['phase']
+            if phase not in progress_by_phase:
+                progress_by_phase[phase] = []
+            progress_by_phase[phase].append(entry)
+        
+        # Calculate overall progress
+        overall_percentage = 0
+        total_entries = len(progress_entries)
+        
+        if total_entries > 0:
+            total_percentage = sum(entry['completion_percentage'] for entry in progress_entries)
+            overall_percentage = total_percentage / total_entries
+        
+        response_data = {
+            "student": {
+                "id": student['id'],
+                "name": student['name'],
+                "registration_number": student['registration_number']
+            },
+            "internship": {
+                "company": internship['company_name'],
+                "type": internship['internship_type'],
+                "start_date": internship['start_date'].strftime('%Y-%m-%d') if isinstance(internship['start_date'], datetime) else internship['start_date'],
+                "end_date": internship['end_date'].strftime('%Y-%m-%d') if isinstance(internship['end_date'], datetime) else internship['end_date']
+            },
+            "progress": {
+                "overall_percentage": round(overall_percentage, 2),
+                "phases": progress_by_phase
+            }
+        }
+        
+        cursor.close()
+        conn.close()
+        
+        return jsonify(response_data), 200
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"message": f"Failed to get student progress: {str(e)}"}), 500
+
+@bp.route('/student/<registration_number>/progress', methods=['POST'])
+@token_required
+@cross_origin(origins="*")
+def update_student_progress(registration_number):
+    """Update progress for a specific student"""
+    try:
+        user_id = request.token_data['user_id']
+        role = request.token_data['role']
+        
+        # Check if user has mentor role
+        if role != 'mentor':
+            return jsonify({'error': 'Mentor access required'}), 403
+            
+        data = request.get_json()
+        if not data:
+            return jsonify({"message": "No progress data provided"}), 400
+            
+        # Check required fields
+        required_fields = ['phase', 'week', 'completion_percentage', 'status']
+        for field in required_fields:
+            if field not in data:
+                return jsonify({"message": f"Missing required field: {field}"}), 400
+        
+        conn = pymysql.connect(
+            host='localhost',
+            user='root',
+            password='yoyobheemsa',
+            database='internship_portal'
+        )
+        
+        cursor = conn.cursor(pymysql.cursors.DictCursor)
+        
+        # Find mentor profile
+        cursor.execute("SELECT * FROM mentors WHERE user_id = %s", (user_id,))
+        mentor = cursor.fetchone()
+        
+        if not mentor:
+            cursor.close()
+            conn.close()
+            return jsonify({"message": "Mentor profile not found."}), 404
+            
+        # Find student
+        cursor.execute("SELECT * FROM students WHERE registration_number = %s", (registration_number,))
+        student = cursor.fetchone()
+        
+        if not student:
+            cursor.close()
+            conn.close()
+            return jsonify({"message": "Student not found."}), 404
+            
+        # Check if student is assigned to this mentor
+        cursor.execute("""
+            SELECT * FROM mentor_assignments 
+            WHERE mentor_id = %s AND registration_number = %s
+        """, (mentor['id'], registration_number))
+        
+        assignment = cursor.fetchone()
+        if not assignment:
+            cursor.close()
+            conn.close()
+            return jsonify({"message": "This student is not assigned to you."}), 403
+            
+        # Validate completion percentage
+        try:
+            completion = int(data['completion_percentage'])
+            if completion < 0 or completion > 100:
+                return jsonify({"message": "Completion percentage must be between 0 and 100"}), 400
+        except ValueError:
+            return jsonify({"message": "Completion percentage must be a number"}), 400
+            
+        # Check if there's an existing progress entry for this phase and week
+        cursor.execute("""
+            SELECT * FROM progress
+            WHERE registration_number = %s AND phase = %s AND week = %s
+        """, (registration_number, data['phase'], data['week']))
+        
+        existing_progress = cursor.fetchone()
+        
+        if existing_progress:
+            # Update existing progress entry
+            cursor.execute("""
+                UPDATE progress
+                SET completion_percentage = %s, status = %s, updated_at = NOW()
+                WHERE id = %s
+            """, (
+                completion,
+                data['status'],
+                existing_progress['id']
+            ))
+            
+            progress_id = existing_progress['id']
+            message = "Progress updated successfully"
+        else:
+            # Create new progress entry
+            cursor.execute("""
+                INSERT INTO progress
+                    (registration_number, phase, week, completion_percentage, status, created_at, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, NOW(), NOW())
+            """, (
+                registration_number,
+                data['phase'],
+                data['week'],
+                completion,
+                data['status']
+            ))
+            
+            progress_id = cursor.lastrowid
+            message = "Progress created successfully"
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        return jsonify({
+            "message": message,
+            "progress_id": progress_id
+        }), 200
+        
+    except Exception as e:
+        if 'conn' in locals() and conn:
+            conn.close()
+        import traceback
+        traceback.print_exc()
+        return jsonify({"message": f"Failed to update progress: {str(e)}"}), 500
+
+@bp.route('/feedback/<registration_number>', methods=['POST'])
+@token_required
+@cross_origin(origins="*")
+def submit_weekly_feedback(registration_number):
+    """Submit weekly feedback for a student"""
+    try:
+        user_id = request.token_data['user_id']
+        role = request.token_data['role']
+        
+        # Check if user has mentor role
+        if role != 'mentor':
+            return jsonify({'error': 'Mentor access required'}), 403
+            
+        data = request.get_json()
+        if not data:
+            return jsonify({"message": "No feedback data provided"}), 400
+            
+        # Check required fields
+        required_fields = ['week', 'performance_rating', 'feedback']
+        for field in required_fields:
+            if field not in data:
+                return jsonify({"message": f"Missing required field: {field}"}), 400
+        
+        conn = pymysql.connect(
+            host='localhost',
+            user='root',
+            password='yoyobheemsa',
+            database='internship_portal'
+        )
+        
+        cursor = conn.cursor(pymysql.cursors.DictCursor)
+        
+        # Find mentor profile
+        cursor.execute("SELECT * FROM mentors WHERE user_id = %s", (user_id,))
+        mentor = cursor.fetchone()
+        
+        if not mentor:
+            cursor.close()
+            conn.close()
+            return jsonify({"message": "Mentor profile not found."}), 404
+            
+        # Find student
+        cursor.execute("SELECT * FROM students WHERE registration_number = %s", (registration_number,))
+        student = cursor.fetchone()
+        
+        if not student:
+            cursor.close()
+            conn.close()
+            return jsonify({"message": "Student not found."}), 404
+            
+        # Check if student is assigned to this mentor
+        cursor.execute("""
+            SELECT * FROM mentor_assignments 
+            WHERE mentor_id = %s AND registration_number = %s
+        """, (mentor['id'], registration_number))
+        
+        assignment = cursor.fetchone()
+        if not assignment:
+            cursor.close()
+            conn.close()
+            return jsonify({"message": "This student is not assigned to you."}), 403
+            
+        # Validate performance rating
+        try:
+            rating = int(data['performance_rating'])
+            if rating < 1 or rating > 5:
+                return jsonify({"message": "Performance rating must be between 1 and 5"}), 400
+        except ValueError:
+            return jsonify({"message": "Performance rating must be a number"}), 400
+            
+        # Check if there's already feedback for this week
+        cursor.execute("""
+            SELECT * FROM weekly_feedback
+            WHERE registration_number = %s AND mentor_id = %s AND week = %s
+        """, (registration_number, mentor['id'], data['week']))
+        
+        existing_feedback = cursor.fetchone()
+        
+        if existing_feedback:
+            # Update existing feedback
+            cursor.execute("""
+                UPDATE weekly_feedback
+                SET performance_rating = %s, feedback = %s, areas_of_improvement = %s, strengths = %s, updated_at = NOW()
+                WHERE id = %s
+            """, (
+                rating,
+                data['feedback'],
+                data.get('areas_of_improvement', ''),
+                data.get('strengths', ''),
+                existing_feedback['id']
+            ))
+            
+            feedback_id = existing_feedback['id']
+            message = "Weekly feedback updated successfully"
+        else:
+            # Create new feedback
+            cursor.execute("""
+                INSERT INTO weekly_feedback
+                    (registration_number, mentor_id, week, performance_rating, feedback, areas_of_improvement, strengths, created_at, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+            """, (
+                registration_number,
+                mentor['id'],
+                data['week'],
+                rating,
+                data['feedback'],
+                data.get('areas_of_improvement', ''),
+                data.get('strengths', '')
+            ))
+            
+            feedback_id = cursor.lastrowid
+            message = "Weekly feedback submitted successfully"
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        return jsonify({
+            "message": message,
+            "feedback_id": feedback_id
+        }), 200
+        
+    except Exception as e:
+        if 'conn' in locals() and conn:
+            conn.close()
+        import traceback
+        traceback.print_exc()
+        return jsonify({"message": f"Failed to submit weekly feedback: {str(e)}"}), 500
+
+# Development endpoint for mentor students - No authentication required
+@bp.route('/dev/students', methods=['GET'])
+@cross_origin(origins="*")
+def get_dev_assigned_students():
+    try:
+        # For development, just return all students without authentication
+        students = Student.query.limit(10).all()  # Get first 10 students
+        
+        students_data = []
+        for student in students:
+            # Simplified response for development
+            students_data.append({
+                'id': student.id,
+                'user_id': student.user_id,
+                'name': student.name,
+                'email': 'dev@example.com',  # Placeholder email
+                'registration_number': student.registration_number,
+                'batch': student.batch,
+                'status': 'active',
+                'progress': 50  # Default progress value
+            })
+            
+        return jsonify(students_data), 200
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
+
+@bp.route('/dev/assignments', methods=['GET'])
+@cross_origin(origins="*")
+def get_dev_mentor_assignments():
+    """Development endpoint for mentor assignments - no authentication required"""
+    try:
+        # Get all mentor assignments
+        all_mentors = Mentor.query.all()
+        
+        result = []
+        for mentor in all_mentors:
+            # Get mentor user for email
+            mentor_user = User.query.get(mentor.user_id) if mentor.user_id else None
+            
+            # Get students assigned to this mentor
+            students = Student.query.filter_by(mentor_id=mentor.id).all()
+            
+            student_data = []
+            for student in students:
+                student_user = User.query.get(student.user_id) if student.user_id else None
+                student_data.append({
+                    'id': student.id,
+                    'name': student.name,
+                    'registration_number': student.registration_number,
+                    'email': student_user.email if student_user else None
+                })
+            
+            result.append({
+                'mentor': {
+                    'id': mentor.id,
+                    'name': mentor.name,
+                    'department': mentor.department,
+                    'email': mentor_user.email if mentor_user else None
+                },
+                'students': student_data,
+                'student_count': len(student_data)
+            })
+            
+        return jsonify(result), 200
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
+
+@bp.route('/dev/assign-mentor', methods=['POST'])
+@cross_origin(origins="*")
+def dev_assign_mentor():
+    """Development endpoint to assign a mentor to a student - no authentication required"""
+    try:
+        data = request.get_json()
+        
+        # Validate input
+        if not data or 'mentor_id' not in data or 'student_id' not in data:
+            return jsonify({'error': 'Missing required fields: mentor_id and student_id'}), 400
+            
+        mentor_id = data['mentor_id']
+        student_id = data['student_id']
+        
+        # Check if mentor exists
+        mentor = Mentor.query.get(mentor_id)
+        if not mentor:
+            return jsonify({'error': f'Mentor with id {mentor_id} not found'}), 404
+            
+        # Check if student exists
+        student = Student.query.get(student_id)
+        if not student:
+            return jsonify({'error': f'Student with id {student_id} not found'}), 404
+            
+        # Assign mentor to student
+        student.mentor_id = mentor_id
+        db.session.commit()
+        
+        return jsonify({
+            'success': True,
+            'message': f'Mentor {mentor.name} assigned to student {student.name}',
+            'student': {
+                'id': student.id,
+                'name': student.name,
+                'registration_number': student.registration_number
+            },
+            'mentor': {
+                'id': mentor.id,
+                'name': mentor.name,
+                'department': mentor.department
+            }
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
+
+@bp.route('/student/<registration_number>/internship', methods=['GET'])
+@token_required
+@cross_origin(origins="*")
+def get_student_internship(registration_number):
+    try:
+        # Get mentor from token
+        user_id = request.token_data['user_id']
+        role = request.token_data['role']
+        
+        # Check if user has mentor role
+        if role != 'mentor':
+            return jsonify({'error': 'Mentor access required'}), 403
+        
+        # Get mentor profile
+        mentor = Mentor.query.filter_by(user_id=user_id).first()
+        if not mentor:
+            return jsonify({'error': 'Mentor profile not found'}), 404
+        
+        # Get student details
+        student = Student.query.filter_by(registration_number=registration_number).first()
+        if not student:
+            return jsonify({'error': 'Student not found'}), 404
+        
+        # Check if this mentor is assigned to the student
+        if student.mentor_id != mentor.id:
+            return jsonify({'error': 'You are not assigned as a mentor to this student'}), 403
+        
+        # Get internship details
+        internship = Internship.query.filter_by(registration_number=registration_number).first()
+        if not internship:
+            return jsonify({'message': 'No internship found for this student', 'internship': None}), 200
+        
+        return jsonify({'internship': internship.to_dict()}), 200
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
+
+@bp.route('/student/<registration_number>/internship', methods=['POST', 'PUT'])
+@token_required
+@cross_origin(origins="*")
+def update_student_internship(registration_number):
+    try:
+        # Get mentor from token
+        user_id = request.token_data['user_id']
+        role = request.token_data['role']
+        
+        # Check if user has mentor role
+        if role != 'mentor':
+            return jsonify({'error': 'Mentor access required'}), 403
+        
+        # Get mentor profile
+        mentor = Mentor.query.filter_by(user_id=user_id).first()
+        if not mentor:
+            return jsonify({'error': 'Mentor profile not found'}), 404
+        
+        # Get student details
+        student = Student.query.filter_by(registration_number=registration_number).first()
+        if not student:
+            return jsonify({'error': 'Student not found'}), 404
+        
+        # Check if this mentor is assigned to the student
+        if student.mentor_id != mentor.id:
+            return jsonify({'error': 'You are not assigned as a mentor to this student'}), 403
+        
+        # Get request data
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+        
+        # Get existing internship or create new one
+        internship = Internship.query.filter_by(registration_number=registration_number).first()
+        
+        if not internship:
+            # Create new internship record
+            internship = Internship(
+                registration_number=registration_number,
+                company_name=data.get('company_name', ''),
+                internship_type=data.get('internship_type', 'in-house'),
+                start_date=data.get('start_date'),
+                end_date=data.get('end_date'),
+                stipend=data.get('stipend'),
+                location=data.get('location'),
+                hr_contact=data.get('hr_contact'),
+                hr_email=data.get('hr_email'),
+                role=data.get('role'),
+                description=data.get('description'),
+                skills=data.get('skills'),
+                mentor_approval=True,  # Automatically approve when created by mentor
+                mentor_id=mentor.id
+            )
+            db.session.add(internship)
+        else:
+            # Update existing internship
+            if 'company_name' in data:
+                internship.company_name = data['company_name']
+            if 'internship_type' in data:
+                internship.internship_type = data['internship_type']
+            if 'start_date' in data:
+                internship.start_date = data['start_date']
+            if 'end_date' in data:
+                internship.end_date = data['end_date']
+            if 'stipend' in data:
+                internship.stipend = data['stipend']
+            if 'location' in data:
+                internship.location = data['location']
+            if 'hr_contact' in data:
+                internship.hr_contact = data['hr_contact']
+            if 'hr_email' in data:
+                internship.hr_email = data['hr_email']
+            if 'role' in data:
+                internship.role = data['role']
+            if 'description' in data:
+                internship.description = data['description']
+            if 'skills' in data:
+                internship.skills = data['skills']
+            if 'mentor_approval' in data:
+                internship.mentor_approval = data['mentor_approval']
+            
+            # Always update the mentor ID
+            internship.mentor_id = mentor.id
+        
+        # Update student's internship company field as well
+        if data.get('company_name'):
+            student.internship_company = data['company_name']
+        
+        db.session.commit()
+        
+        return jsonify({
+            'message': 'Internship details updated successfully',
+            'internship': internship.to_dict()
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
+
+@bp.route('/dev/student/<registration_number>/internship', methods=['GET'])
+@cross_origin(origins="*")
+def dev_get_student_internship(registration_number):
+    """Development endpoint for getting student internship details without authentication"""
+    try:
+        # Get student details
+        student = Student.query.filter_by(registration_number=registration_number).first()
+        if not student:
+            return jsonify({'error': 'Student not found'}), 404
+        
+        # Get internship details
+        internship = Internship.query.filter_by(registration_number=registration_number).first()
+        if not internship:
+            return jsonify({'message': 'No internship found for this student', 'internship': None}), 200
+        
+        return jsonify({'internship': internship.to_dict()}), 200
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
+
+@bp.route('/dev/student/<registration_number>/internship', methods=['POST', 'PUT'])
+@cross_origin(origins="*")
+def dev_update_student_internship(registration_number):
+    """Development endpoint for updating student internship details without authentication"""
+    try:
+        # Get student details
+        student = Student.query.filter_by(registration_number=registration_number).first()
+        if not student:
+            return jsonify({'error': 'Student not found'}), 404
+        
+        # For development purposes, get the first mentor
+        mentor = Mentor.query.first()
+        if not mentor:
+            return jsonify({'error': 'No mentors found in the system'}), 500
+        
+        # Get request data
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+        
+        # Get existing internship or create new one
+        internship = Internship.query.filter_by(registration_number=registration_number).first()
+        
+        if not internship:
+            # Create new internship record
+            internship = Internship(
+                registration_number=registration_number,
+                company_name=data.get('company_name', ''),
+                internship_type=data.get('internship_type', 'in-house'),
+                start_date=data.get('start_date'),
+                end_date=data.get('end_date'),
+                stipend=data.get('stipend'),
+                location=data.get('location'),
+                hr_contact=data.get('hr_contact'),
+                hr_email=data.get('hr_email'),
+                role=data.get('role'),
+                description=data.get('description'),
+                skills=data.get('skills'),
+                mentor_approval=True,  # Automatically approve when created by mentor
+                mentor_id=mentor.id
+            )
+            db.session.add(internship)
+        else:
+            # Update existing internship
+            if 'company_name' in data:
+                internship.company_name = data['company_name']
+            if 'internship_type' in data:
+                internship.internship_type = data['internship_type']
+            if 'start_date' in data:
+                internship.start_date = data['start_date']
+            if 'end_date' in data:
+                internship.end_date = data['end_date']
+            if 'stipend' in data:
+                internship.stipend = data['stipend']
+            if 'location' in data:
+                internship.location = data['location']
+            if 'hr_contact' in data:
+                internship.hr_contact = data['hr_contact']
+            if 'hr_email' in data:
+                internship.hr_email = data['hr_email']
+            if 'role' in data:
+                internship.role = data['role']
+            if 'description' in data:
+                internship.description = data['description']
+            if 'skills' in data:
+                internship.skills = data['skills']
+            if 'mentor_approval' in data:
+                internship.mentor_approval = data['mentor_approval']
+            
+            # Always update the mentor ID
+            internship.mentor_id = mentor.id
+        
+        # Update student's internship company field as well
+        if data.get('company_name'):
+            student.internship_company = data['company_name']
+        
+        db.session.commit()
+        
+        return jsonify({
+            'message': 'Internship details updated successfully',
+            'internship': internship.to_dict()
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e), 'trace': traceback.format_exc()}), 500
+
+@bp.route('/students', methods=['POST', 'OPTIONS'])
+@token_required
+def create_student():
+"""Fixed implementation of the create_student endpoint to handle 422 errors"""
+    # Handle preflight OPTIONS request first
+    if request.method == 'OPTIONS':
+        response = jsonify({'status': 'success'})
+        response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+        return response
+        
+    try:
+        # Get mentor_id from token
+        user_id = request.token_data['user_id']
+        role = request.token_data['role']
+        
+        # Check if user has mentor role
+        if role != 'mentor':
+            return jsonify({'error': 'Mentor access required'}), 403
+        
+        # Get the mentor record
+        mentor = Mentor.query.filter_by(user_id=user_id).first()
+        if not mentor:
+            return jsonify({"error": "Mentor profile not found"}), 404
+        
+        # Get request data
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+        
+        # Log the received data for debugging
+        print(f"Received data: {data}")
+        
+        # Check required fields
+        required_fields = ['email', 'first_name', 'last_name', 'registration_number', 'batch']
+        missing_fields = [field for field in required_fields if field not in data]
+        
+        if missing_fields:
+            return jsonify({'error': f'Missing required fields: {", ".join(missing_fields)}'}), 400
+        
+        # Check if registration number is already in use
+        existing_student = Student.query.filter_by(registration_number=data['registration_number']).first()
+        if existing_student:
+            return jsonify({'error': 'Registration number already in use'}), 400
+        
+        # Check if user with this email already exists
+        existing_user = User.query.filter_by(email=data['email']).first()
+        
+        # Create connection directly to database for more controlled operations
+        conn = pymysql.connect(
+            host='localhost',
+            user='root',
+            password='yoyobheemsa',
+            database='internship_portal',
+            charset='utf8mb4',
+            cursorclass=pymysql.cursors.DictCursor
+        )
+        
+        try:
+            cursor = conn.cursor()
+            
+            if existing_user:
+                user_id = existing_user.id
+                print(f"Using existing user with ID: {user_id}")
+            else:
+                # Create new user
+                print("Creating new user")
+                password = data.get('password', 'changeme123')
+                password_hash = User.generate_password_hash(password)
+                
+                cursor.execute("""
+                    INSERT INTO users (email, first_name, last_name, role, password)
+                    VALUES (%s, %s, %s, %s, %s)
+                """, (
+                    data['email'],
+                    data['first_name'],
+                    data['last_name'],
+                    'student',
+                    password_hash
+                ))
+                user_id = cursor.lastrowid
+                print(f"Created new user with ID: {user_id}")
+            
+            # Create student record
+            full_name = f"{data['first_name']} {data['last_name']}"
+            print(f"Creating student with name: {full_name}")
+            
+            cursor.execute("""
+                INSERT INTO students (user_id, name, registration_number, batch, mentor_id)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (
+                user_id,
+                full_name,
+                data['registration_number'],
+                data['batch'],
+                mentor.id
+            ))
+            student_id = cursor.lastrowid
+            print(f"Created student with ID: {student_id}")
+            
+            # Create mentor assignment
+            cursor.execute("""
+                INSERT INTO mentor_assignments (mentor_id, registration_number)
+                VALUES (%s, %s)
+            """, (
+                mentor.id,
+                data['registration_number']
+            ))
+            assignment_id = cursor.lastrowid
+            print(f"Created mentor assignment with ID: {assignment_id}")
+            
+            # Commit the transaction
+            conn.commit()
+            print("Transaction committed successfully")
+            
+            # Return success response
+            return jsonify({
+                'message': 'Student created and assigned successfully',
+                'student': {
+                    'id': student_id,
+                    'name': full_name,
+                    'email': data['email'],
+                    'registration_number': data['registration_number'],
+                    'batch': data['batch']
+                }
+            }), 201
+            
+        except Exception as db_error:
+            conn.rollback()
+            print(f"Database error: {str(db_error)}")
+            return jsonify({"error": f"Database error: {str(db_error)}"}), 500
+        finally:
+            conn.close()
+            
+    except Exception as e:
+        print(f"Error creating student: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": f"Failed to create student: {str(e)}"}), 500
+@bp.route('/debug', methods=['GET', 'POST', 'OPTIONS'])
+@cross_origin(origins="*")
+def debug_endpoint():
+    """Debug endpoint to help diagnose issues with requests"""
+    response_data = {
+        'method': request.method,
+        'path': request.path,
+        'headers': dict(request.headers),
+        'content_type': request.content_type,
+        'is_json': request.is_json,
+        'data': None,
+        'form': None,
+        'json': None,
+        'cookies': dict(request.cookies),
+        'args': dict(request.args)
+    }
+    
+    # Try to get each type of data
+    try:
+        response_data['data'] = request.data.decode('utf-8') if request.data else None
+    except:
+        response_data['data'] = 'Error decoding data'
+    
+    try:
+        response_data['form'] = dict(request.form)
+    except:
+        response_data['form'] = 'Error accessing form data'
+    
+    try:
+        response_data['json'] = request.get_json(silent=True)
+    except:
+        response_data['json'] = 'Error parsing JSON'
+    
+    return jsonify({
+        'message': 'Debug info',
+        'request_info': response_data,
+        'python_version': sys.version,
+        'timestamp': datetime.datetime.now().isoformat()
+    }) 

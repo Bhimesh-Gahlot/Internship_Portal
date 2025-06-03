@@ -1,0 +1,30 @@
+{% extends 'base.html' %}
+
+{% block content %}
+<div class="container mt-4">
+    <h2>Mentor-Student Relationships</h2>
+    
+    <div class="table-responsive">
+        <table class="table table-striped">
+            <thead>
+                <tr>
+                    <th>Mentor Name</th>
+                    <th>Student Name</th>
+                    <th>Student ID</th>
+                    <th>Assignment Date</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for relation in relationships %}
+                <tr>
+                    <td>{{ relation.mentor.get_full_name }}</td>
+                    <td>{{ relation.student.get_full_name }}</td>
+                    <td>{{ relation.student.id }}</td>
+                    <td>{{ relation.created_at|date:"M d, Y" }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %} 
