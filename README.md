@@ -3,11 +3,11 @@ Internship Portal
 
 Project Overview
 
-Internship Portal is a comprehensive platform designed to streamline and enhance the management of student internships in colleges and universities. As internships have become a crucial part of higher education, institutions face increasing challenges in tracking student progress, ensuring compliance, and maintaining effective communication between students, mentors, and administrators.
+Internship Portal is a comprehensive platform designed to streamline and enhance the management of student internships and projects in colleges and universities. As internships have become a crucial part of higher education, institutions face increasing challenges in tracking student progress, ensuring compliance, and maintaining effective communication between students, mentors, and administrators.
 
 Why Do Colleges Need This Portal?
 
-- Centralized Management: Traditional internship management often relies on scattered spreadsheets, emails, and manual paperwork, making it difficult to track student placements, progress, and feedback. This portal brings all stakeholders onto a single, organized platform.
+- Centralized Management: Traditional internship and project management often relies on scattered spreadsheets, emails, and manual paperwork, making it difficult to track student placements, progress, and feedback. This portal brings all stakeholders onto a single, organized platform.
 - Transparency & Accountability: The portal ensures that every step of the internship process is documented and visible to students, mentors, and administrators, reducing the risk of miscommunication or lost information.
 - Efficient Communication: Built-in messaging and feedback features foster timely and structured communication between students and mentors, helping students receive the guidance they need.
 - Automated Reporting: Students can submit weekly, monthly, and final reports directly through the portal, while mentors and admins can review and approve them efficiently. This reduces administrative overhead and ensures compliance with academic requirements.
@@ -72,10 +72,16 @@ In summary, the Internship Portal transforms the internship experience for educa
   - Filter reports by date range and type
   - Export/download reports
   - View report submission and approval statistics
+ 
+
+
+
 
 
 🧑‍🏫 Mentor Dashboard Features
-![Mentor dashboard](./public/Mentor dashboard.png)
+![Screenshot 2025-06-03 224651](https://github.com/user-attachments/assets/6731643b-b08e-4629-a4e9-47ebedda4d57)
+
+
 - Dashboard Overview
   - View statistics: total students, active, pending, completed
   - Quick search and filter for students
@@ -93,10 +99,15 @@ In summary, the Internship Portal transforms the internship experience for educa
   - View feedback history
 - Theme Toggle
   - Switch between light and dark mode
+ 
+
+
+
 
 
 🧑‍🎓 Student Dashboard Features
-![Student dashboard](./public/Student dashboard.png)
+![Screenshot 2025-06-03 224629](https://github.com/user-attachments/assets/27fc613f-cec1-4584-a83f-15e729c26fb2)
+
 
 - Overview
   - See internship status, progress percentage, reports submitted, days remaining
